@@ -1,14 +1,17 @@
 //! Runs an RV32 payload: either an ELF32 executable, or a flat binary loaded
 //! at DRAM_BASE if the file has no ELF magic.
 //!
-//!     nanoemu <image> [--trace] [--max-steps N] [--quiet]
+//!     nanoemu <image> [--rv32|--rv64] [--trace] [--max-steps N] [--quiet]
+//!
+//! An ELF selects its own width from its class; --rv32/--rv64 only apply to a
+//! flat image, and default to RV64.
 //!
 //! The exit code is 0 on success, 1 on a test failure or unhandled trap, and
 //! 3 if the step budget ran out.
 
 use std::process::ExitCode;
 
-use nanoemu::cpu::{Cpu, Exit};
+use nanoemu::cpu::{Cpu, Exit, Xlen};
 use nanoemu::decode::REG_NAMES;
 use nanoemu::elf::Elf;
 
@@ -20,12 +23,15 @@ fn main() -> ExitCode {
     let mut path = None;
     let mut trace = false;
     let mut quiet = false;
+    let mut xlen = Xlen::Rv64;
     let mut max_steps = DEFAULT_MAX_STEPS;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--trace" => trace = true,
             "--quiet" => quiet = true,
+            "--rv32" => xlen = Xlen::Rv32,
+            "--rv64" => xlen = Xlen::Rv64,
             "--max-steps" => {
                 max_steps = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) => n,
@@ -40,7 +46,7 @@ fn main() -> ExitCode {
     }
 
     let Some(path) = path else {
-        eprintln!("usage: nanoemu <image> [--trace] [--max-steps N] [--quiet]");
+        eprintln!("usage: nanoemu <image> [--rv32|--rv64] [--trace] [--max-steps N] [--quiet]");
         return ExitCode::from(2);
     };
 
@@ -52,7 +58,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut cpu = Cpu::new(MEM_SIZE);
+    // A flat image has no class to read, so it needs the width stated; an ELF
+    // overrides this from its own header.
+    let mut cpu = Cpu::new(MEM_SIZE, xlen);
     // Anything without the ELF magic is treated as a flat image at DRAM_BASE.
     if image.starts_with(b"\x7fELF") {
         match Elf::parse(&image) {
@@ -75,8 +83,11 @@ fn main() -> ExitCode {
         // Tracing needs per-step control, so the run loop is inlined here.
         let mut outcome = Exit::StepLimit;
         for _ in 0..max_steps {
+            // Field width follows XLEN, so an RV64 trace is not silently
+            // truncated to its low word.
+            let w = (cpu.xlen.bits() / 4) as usize;
             eprintln!(
-                "{:08x}  a0={:08x} ra={:08x}",
+                "{:0w$x}  a0={:0w$x} ra={:0w$x}",
                 cpu.pc, cpu.regs[10], cpu.regs[1]
             );
             outcome = cpu.run(1);
@@ -116,12 +127,15 @@ fn report(cpu: &Cpu, outcome: Exit, quiet: bool) -> ExitCode {
         "retired {} instructions",
         cpu.csrs.read(nanoemu::csr::INSTRET)
     );
+    let w = (cpu.xlen.bits() / 4) as usize;
+    let per_row = if w > 8 { 2 } else { 4 };
     for (i, name) in REG_NAMES.iter().enumerate() {
-        eprint!(
-            "{name:>4}={:08x}{}",
-            cpu.regs[i],
-            if i % 4 == 3 { "\n" } else { " " }
-        );
+        let end = if i % per_row == per_row - 1 {
+            "\n"
+        } else {
+            "  "
+        };
+        eprint!("{name:>4}={:0w$x}{end}", cpu.regs[i]);
     }
     ExitCode::from(code)
 }

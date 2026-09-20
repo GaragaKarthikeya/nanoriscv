@@ -1,39 +1,99 @@
-//! RV32IM hart, machine mode only.
+//! A RISC-V hart, machine mode only, RV32 or RV64.
 //!
 //! `step()` executes exactly one instruction and is the unit the RTL core will
 //! be diffed against: after each step the architectural state here (pc, x1..x31,
 //! and the machine CSRs) must match the core's retire-stage state exactly.
+//!
+//! Both widths live in one implementation because the RTL core is RV32 while
+//! the software side is heading for RV64, and a single model keeps those from
+//! drifting apart. The trick that makes it cheap: RV64's `*W` instructions have
+//! exactly RV32 semantics plus a sign-extension, so every ALU operation is
+//! written once and parameterised by a `width` -- 32 or 64 -- rather than
+//! duplicated per extension.
 
 use crate::csr::{self, CsrFile};
 use crate::decode::*;
 use crate::memory::{Memory, DRAM_BASE};
 use crate::trap::Exception;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Xlen {
+    Rv32,
+    Rv64,
+}
+
+impl Xlen {
+    pub fn bits(self) -> u32 {
+        match self {
+            Xlen::Rv32 => 32,
+            Xlen::Rv64 => 64,
+        }
+    }
+}
+
+/// Sign-extends the low `width` bits of `v` to 64 bits.
+#[inline]
+fn sext(v: u64, width: u32) -> u64 {
+    if width >= 64 {
+        v
+    } else {
+        let shift = 64 - width;
+        (((v << shift) as i64) >> shift) as u64
+    }
+}
+
+/// Keeps only the low `width` bits.
+#[inline]
+fn trunc(v: u64, width: u32) -> u64 {
+    if width >= 64 {
+        v
+    } else {
+        v & ((1u64 << width) - 1)
+    }
+}
+
 pub struct Cpu {
-    /// x0 is stored but always reads as zero; writes to it are dropped.
-    pub regs: [u32; 32],
-    pub pc: u32,
+    /// Registers hold the zero-extended XLEN-bit value, so on RV32 they read
+    /// back exactly as the 32-bit core's register file will. x0 is stored but
+    /// always reads as zero.
+    pub regs: [u64; 32],
+    pub pc: u64,
+    pub xlen: Xlen,
     pub csrs: CsrFile,
     pub mem: Memory,
     pub cycle: u64,
 }
 
 impl Cpu {
-    pub fn new(mem_size: usize) -> Self {
+    pub fn new(mem_size: usize, xlen: Xlen) -> Self {
         let mut cpu = Cpu {
             regs: [0; 32],
-            pc: DRAM_BASE as u32,
+            pc: DRAM_BASE,
+            xlen,
             csrs: CsrFile::new(),
             mem: Memory::new(mem_size),
             cycle: 0,
         };
         // Stack pointer starts at the top of DRAM, as a bare-metal ABI expects.
-        cpu.regs[2] = DRAM_BASE as u32 + mem_size as u32;
+        cpu.regs[2] = DRAM_BASE + mem_size as u64;
         cpu
     }
 
+    pub fn rv32(mem_size: usize) -> Self {
+        Cpu::new(mem_size, Xlen::Rv32)
+    }
+
+    pub fn rv64(mem_size: usize) -> Self {
+        Cpu::new(mem_size, Xlen::Rv64)
+    }
+
     #[inline]
-    fn rr(&self, r: usize) -> u32 {
+    fn xbits(&self) -> u32 {
+        self.xlen.bits()
+    }
+
+    #[inline]
+    fn rr(&self, r: usize) -> u64 {
         if r == 0 {
             0
         } else {
@@ -41,21 +101,28 @@ impl Cpu {
         }
     }
 
+    /// Writes a register, normalising to the XLEN-bit canonical form.
     #[inline]
-    fn wr(&mut self, r: usize, v: u32) {
+    fn wr(&mut self, r: usize, v: u64) {
         if r != 0 {
-            self.regs[r] = v;
+            self.regs[r] = trunc(v, self.xbits());
         }
+    }
+
+    /// Register value interpreted as signed at the current XLEN.
+    #[inline]
+    fn rs(&self, r: usize) -> i64 {
+        sext(self.rr(r), self.xbits()) as i64
     }
 
     fn fetch(&self) -> Result<u32, Exception> {
         if self.pc & 0x3 != 0 {
-            return Err(Exception::InstructionAccessFault(self.pc as u64));
+            return Err(Exception::InstructionAccessFault(self.pc));
         }
         self.mem
-            .read(self.pc as u64, 4)
+            .read(self.pc, 4)
             .map(|v| v as u32)
-            .map_err(|_| Exception::InstructionAccessFault(self.pc as u64))
+            .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
 
     /// Fetches, executes and retires one instruction. On an exception the trap
@@ -90,134 +157,145 @@ impl Cpu {
     ///
     /// `inst_pc` is the address of the instruction that raised the exception,
     /// which is what mepc must hold -- not wherever execute() left self.pc.
-    fn trap(&mut self, e: Exception, inst_pc: u32) {
-        self.csrs.write(csr::MEPC, inst_pc as u64);
+    fn trap(&mut self, e: Exception, inst_pc: u64) {
+        self.csrs.write(csr::MEPC, inst_pc);
         self.csrs.write(csr::MCAUSE, e.cause());
         self.csrs.write(csr::MTVAL, e.tval());
-        let mtvec = self.csrs.read(csr::MTVEC) as u32;
-        self.pc = mtvec & !0x3;
+        self.pc = self.csrs.read(csr::MTVEC) & !0x3;
     }
 
-    fn execute(&mut self, inst: u32, next_pc: u32) -> Result<(), Exception> {
+    fn execute(&mut self, inst: u32, next_pc: u64) -> Result<(), Exception> {
         let (rd, rs1, rs2) = (rd(inst), rs1(inst), rs2(inst));
         let (f3, f7) = (funct3(inst), funct7(inst));
+        let xb = self.xbits();
         let illegal = Err(Exception::IllegalInstruction(inst));
+        let inst_pc = next_pc.wrapping_sub(4);
         self.pc = next_pc;
 
         match opcode(inst) {
             // LUI
-            0x37 => self.wr(rd, imm_u(inst) as u32),
-            // AUIPC — relative to the instruction's own address, not next_pc.
-            0x17 => self.wr(rd, next_pc.wrapping_sub(4).wrapping_add(imm_u(inst) as u32)),
+            0x37 => self.wr(rd, imm_u(inst) as i64 as u64),
+            // AUIPC -- relative to the instruction's own address, not next_pc.
+            0x17 => self.wr(rd, inst_pc.wrapping_add(imm_u(inst) as i64 as u64)),
             // JAL
             0x6f => {
                 self.wr(rd, next_pc);
-                self.pc = next_pc.wrapping_sub(4).wrapping_add(imm_j(inst) as u32);
+                self.pc = inst_pc.wrapping_add(imm_j(inst) as i64 as u64);
             }
-            // JALR — the low bit of the target is cleared by the spec.
+            // JALR -- the low bit of the target is cleared by the spec.
             0x67 if f3 == 0 => {
-                let target = self.rr(rs1).wrapping_add(imm_i(inst) as u32) & !1;
+                let target = self.rr(rs1).wrapping_add(imm_i(inst) as i64 as u64) & !1;
                 self.wr(rd, next_pc);
-                self.pc = target;
+                self.pc = trunc(target, xb);
             }
             // BRANCH
             0x63 => {
                 let (a, b) = (self.rr(rs1), self.rr(rs2));
+                let (sa, sb) = (self.rs(rs1), self.rs(rs2));
                 let taken = match f3 {
-                    0x0 => a == b,                   // BEQ
-                    0x1 => a != b,                   // BNE
-                    0x4 => (a as i32) < (b as i32),  // BLT
-                    0x5 => (a as i32) >= (b as i32), // BGE
-                    0x6 => a < b,                    // BLTU
-                    0x7 => a >= b,                   // BGEU
+                    0x0 => a == b,   // BEQ
+                    0x1 => a != b,   // BNE
+                    0x4 => sa < sb,  // BLT
+                    0x5 => sa >= sb, // BGE
+                    0x6 => a < b,    // BLTU
+                    0x7 => a >= b,   // BGEU
                     _ => return illegal,
                 };
                 if taken {
-                    self.pc = next_pc.wrapping_sub(4).wrapping_add(imm_b(inst) as u32);
+                    self.pc = trunc(inst_pc.wrapping_add(imm_b(inst) as i64 as u64), xb);
                 }
             }
             // LOAD
             0x03 => {
-                let addr = self.rr(rs1).wrapping_add(imm_i(inst) as u32) as u64;
+                let addr = self.rr(rs1).wrapping_add(imm_i(inst) as i64 as u64);
+                let addr = trunc(addr, xb);
+                // LD and LWU do not exist on RV32.
                 let v = match f3 {
-                    0x0 => self.mem.read(addr, 1)? as u8 as i8 as i32 as u32, // LB
-                    0x1 => self.mem.read(addr, 2)? as u16 as i16 as i32 as u32, // LH
-                    0x2 => self.mem.read(addr, 4)? as u32,                    // LW
-                    0x4 => self.mem.read(addr, 1)? as u32,                    // LBU
-                    0x5 => self.mem.read(addr, 2)? as u32,                    // LHU
+                    0x0 => sext(self.mem.read(addr, 1)?, 8),    // LB
+                    0x1 => sext(self.mem.read(addr, 2)?, 16),   // LH
+                    0x2 => sext(self.mem.read(addr, 4)?, 32),   // LW
+                    0x3 if xb == 64 => self.mem.read(addr, 8)?, // LD
+                    0x4 => self.mem.read(addr, 1)?,             // LBU
+                    0x5 => self.mem.read(addr, 2)?,             // LHU
+                    0x6 if xb == 64 => self.mem.read(addr, 4)?, // LWU
                     _ => return illegal,
                 };
                 self.wr(rd, v);
             }
             // STORE
             0x23 => {
-                let addr = self.rr(rs1).wrapping_add(imm_s(inst) as u32) as u64;
-                let v = self.rr(rs2) as u64;
-                match f3 {
-                    0x0 => self.mem.write(addr, 1, v)?,
-                    0x1 => self.mem.write(addr, 2, v)?,
-                    0x2 => self.mem.write(addr, 4, v)?,
+                let addr = self.rr(rs1).wrapping_add(imm_s(inst) as i64 as u64);
+                let addr = trunc(addr, xb);
+                let v = self.rr(rs2);
+                let size = match f3 {
+                    0x0 => 1,
+                    0x1 => 2,
+                    0x2 => 4,
+                    0x3 if xb == 64 => 8, // SD
                     _ => return illegal,
+                };
+                self.mem.write(addr, size, v)?;
+            }
+            // OP-IMM / OP-IMM-32. The 32-bit forms are RV64 only.
+            0x13 | 0x1b => {
+                let width = if opcode(inst) == 0x1b { 32 } else { xb };
+                if width == 32 && opcode(inst) == 0x1b && xb == 32 {
+                    return illegal;
+                }
+                let a = self.rr(rs1);
+                // For shifts the immediate field holds the shift amount; for
+                // everything else it is a sign-extended 12-bit constant.
+                let b = if matches!(f3, 0x1 | 0x5) {
+                    ((inst >> 20) & 0x3f) as u64
+                } else {
+                    imm_i(inst) as i64 as u64
+                };
+                // funct7 doubles as the shift-type selector; on RV64 its low
+                // bit belongs to a 6-bit shift amount, so mask it off.
+                let sel = if matches!(f3, 0x1 | 0x5) { f7 & !1 } else { 0 };
+                match self.alu(f3, sel, a, b, width) {
+                    Some(v) => self.wr(rd, v),
+                    None => return illegal,
                 }
             }
-            // OP-IMM
-            0x13 => {
-                let a = self.rr(rs1);
-                let imm = imm_i(inst);
-                // Shift amount is the low 5 bits of the immediate field on RV32.
-                let shamt = (inst >> 20) & 0x1f;
-                let v = match (f3, f7) {
-                    (0x0, _) => a.wrapping_add(imm as u32),      // ADDI
-                    (0x2, _) => ((a as i32) < imm) as u32,       // SLTI
-                    (0x3, _) => (a < imm as u32) as u32,         // SLTIU
-                    (0x4, _) => a ^ imm as u32,                  // XORI
-                    (0x6, _) => a | imm as u32,                  // ORI
-                    (0x7, _) => a & imm as u32,                  // ANDI
-                    (0x1, 0x00) => a << shamt,                   // SLLI
-                    (0x5, 0x00) => a >> shamt,                   // SRLI
-                    (0x5, 0x20) => ((a as i32) >> shamt) as u32, // SRAI
-                    _ => return illegal,
-                };
-                self.wr(rd, v);
-            }
-            // OP
-            0x33 => {
+            // OP / OP-32. The 32-bit forms are RV64 only.
+            0x33 | 0x3b => {
+                let width = if opcode(inst) == 0x3b { 32 } else { xb };
+                if opcode(inst) == 0x3b && xb == 32 {
+                    return illegal;
+                }
                 let (a, b) = (self.rr(rs1), self.rr(rs2));
-                let shamt = b & 0x1f;
-                let v = match (f3, f7) {
-                    (0x0, 0x00) => a.wrapping_add(b),                // ADD
-                    (0x0, 0x20) => a.wrapping_sub(b),                // SUB
-                    (0x1, 0x00) => a << shamt,                       // SLL
-                    (0x2, 0x00) => ((a as i32) < (b as i32)) as u32, // SLT
-                    (0x3, 0x00) => (a < b) as u32,                   // SLTU
-                    (0x4, 0x00) => a ^ b,                            // XOR
-                    (0x5, 0x00) => a >> shamt,                       // SRL
-                    (0x5, 0x20) => ((a as i32) >> shamt) as u32,     // SRA
-                    (0x6, 0x00) => a | b,                            // OR
-                    (0x7, 0x00) => a & b,                            // AND
-                    (_, 0x01) => self.muldiv(f3, a, b),
-                    _ => return illegal,
+                let v = if f7 == 0x01 {
+                    match self.muldiv(f3, a, b, width) {
+                        Some(v) => v,
+                        None => return illegal,
+                    }
+                } else {
+                    match self.alu(f3, f7, a, b, width) {
+                        Some(v) => v,
+                        None => return illegal,
+                    }
                 };
                 self.wr(rd, v);
             }
-            // MISC-MEM: FENCE is a no-op on a single in-order hart.
+            // MISC-MEM: FENCE and FENCE.I are no-ops on a single in-order hart.
             0x0f => {}
             // SYSTEM
             0x73 => match f3 {
                 0x0 => match inst >> 20 {
                     0x000 => return Err(Exception::EnvironmentCall),
                     0x001 => return Err(Exception::Breakpoint),
-                    // MRET
-                    0x302 => self.pc = self.csrs.read(csr::MEPC) as u32,
+                    0x302 => self.pc = self.csrs.read(csr::MEPC), // MRET
+                    0x105 => {}                                   // WFI: nothing to wait for
                     _ => return illegal,
                 },
                 // Zicsr. The read must happen before the write so that
                 // `csrrw rd, csr, rd` still returns the old value.
                 _ => {
                     let addr = csr(inst);
-                    let old = self.csrs.read(addr) as u32;
+                    let old = self.csrs.read(addr);
                     let src = if f3 & 0x4 != 0 {
-                        rs1 as u32
+                        rs1 as u64
                     } else {
                         self.rr(rs1)
                     };
@@ -229,7 +307,7 @@ impl Cpu {
                     };
                     // A set/clear with rs1 == x0 must not write the CSR at all.
                     if f3 & 0x3 == 0x1 || rs1 != 0 {
-                        self.csrs.write(addr, new as u64);
+                        self.csrs.write(addr, trunc(new, xb));
                     }
                     self.wr(rd, old);
                 }
@@ -239,47 +317,85 @@ impl Cpu {
         Ok(())
     }
 
-    /// The M extension. Division by zero and signed overflow have defined
-    /// results in RISC-V rather than trapping, which is why they are spelled out.
-    /// The zero checks stay explicit rather than folding into `checked_div`, so
-    /// each arm reads the way the spec table does.
+    /// The integer ALU, computed at `width` bits and sign-extended to 64.
+    ///
+    /// Writing it once at a parameterised width is what makes RV64's ADDW,
+    /// SLLW, SRLW and SRAW fall out of the RV32 cases for free.
+    fn alu(&self, f3: u32, f7: u32, a: u64, b: u64, width: u32) -> Option<u64> {
+        let shamt = (b & (width as u64 - 1)) as u32;
+        let (sa, sb) = (sext(a, width), sext(b, width));
+        let v = match (f3, f7) {
+            (0x0, 0x00) => a.wrapping_add(b),                  // ADD / ADDI
+            (0x0, 0x20) => a.wrapping_sub(b),                  // SUB
+            (0x1, 0x00) => a << shamt,                         // SLL
+            (0x2, 0x00) => ((sa as i64) < (sb as i64)) as u64, // SLT
+            (0x3, 0x00) => (trunc(a, width) < trunc(b, width)) as u64, // SLTU
+            (0x4, 0x00) => a ^ b,                              // XOR
+            (0x5, 0x00) => trunc(a, width) >> shamt,           // SRL
+            (0x5, 0x20) => ((sa as i64) >> shamt) as u64,      // SRA
+            (0x6, 0x00) => a | b,                              // OR
+            (0x7, 0x00) => a & b,                              // AND
+            _ => return None,
+        };
+        // SLT and SLTU produce a 0/1 that must not be sign-extended, but since
+        // the result is never negative the extension is a no-op for them.
+        Some(sext(v, width))
+    }
+
+    /// The M extension at `width` bits, which also covers RV64's MULW, DIVW,
+    /// DIVUW, REMW and REMUW.
+    ///
+    /// Division by zero and signed overflow have defined results in RISC-V
+    /// rather than trapping, which is why they are spelled out. The zero checks
+    /// stay explicit rather than folding into `checked_div`, so each arm reads
+    /// the way the spec table does.
     #[allow(clippy::manual_checked_ops)]
-    fn muldiv(&self, f3: u32, a: u32, b: u32) -> u32 {
-        let (sa, sb) = (a as i32, b as i32);
-        match f3 {
-            0x0 => a.wrapping_mul(b),                      // MUL
-            0x1 => ((sa as i64 * sb as i64) >> 32) as u32, // MULH
-            0x2 => ((sa as i64 * b as i64) >> 32) as u32,  // MULHSU
-            0x3 => ((a as u64 * b as u64) >> 32) as u32,   // MULHU
+    fn muldiv(&self, f3: u32, a: u64, b: u64, width: u32) -> Option<u64> {
+        let (sa, sb) = (sext(a, width) as i64, sext(b, width) as i64);
+        let (ua, ub) = (trunc(a, width), trunc(b, width));
+        let v = match f3 {
+            0x0 => a.wrapping_mul(b), // MUL / MULW
+            // The high-half multiplies have no W form, so they are only
+            // reachable at the full register width.
+            0x1 if width == 64 => ((sa as i128 * sb as i128) >> 64) as u64, // MULH
+            0x1 if width == 32 => ((sa * sb) >> 32) as u64,
+            // MULHSU is signed rs1 times *unsigned rs2*, so the unsigned
+            // operand is ub -- using ua here silently computes rs1 twice.
+            0x2 if width == 64 => ((sa as i128 * ub as i128) >> 64) as u64, // MULHSU
+            0x2 if width == 32 => ((sa * ub as i64) >> 32) as u64,
+            0x3 if width == 64 => ((ua as u128 * ub as u128) >> 64) as u64, // MULHU
+            0x3 if width == 32 => (ua * ub) >> 32,
             0x4 => {
-                if b == 0 {
-                    u32::MAX
+                if sb == 0 {
+                    u64::MAX // DIV by zero: all ones
                 } else {
-                    sa.wrapping_div(sb) as u32
+                    sa.wrapping_div(sb) as u64 // wrapping covers MIN / -1
                 }
-            } // DIV
+            }
             0x5 => {
-                if b == 0 {
-                    u32::MAX
+                if ub == 0 {
+                    u64::MAX // DIVU by zero
                 } else {
-                    a / b
+                    ua / ub
                 }
-            } // DIVU
+            }
             0x6 => {
-                if b == 0 {
-                    a
+                if sb == 0 {
+                    sa as u64 // REM by zero: the dividend
                 } else {
-                    sa.wrapping_rem(sb) as u32
+                    sa.wrapping_rem(sb) as u64
                 }
-            } // REM
-            _ => {
-                if b == 0 {
-                    a
+            }
+            0x7 => {
+                if ub == 0 {
+                    ua // REMU by zero
                 } else {
-                    a % b
+                    ua % ub
                 }
-            } // REMU
-        }
+            }
+            _ => return None,
+        };
+        Some(sext(v, width))
     }
 }
 
@@ -290,7 +406,7 @@ pub enum Exit {
     /// The payload wrote 1 to `tohost`.
     Pass,
     /// The payload wrote `(n << 1) | 1`; `n` is the number of the failing test.
-    Fail(u32),
+    Fail(u64),
     /// An ECALL with no `tohost` symbol to interpret it.
     Ecall,
     /// A trap was raised with `mtvec` still zero, so there is no handler to
@@ -302,18 +418,22 @@ pub enum Exit {
 }
 
 impl Cpu {
-    /// Loads an ELF32 image: its PT_LOAD segments, entry point, and the
-    /// `tohost` symbol if the payload exports one.
+    /// Loads an ELF image: its PT_LOAD segments, entry point, the `tohost`
+    /// symbol if the payload exports one, and the XLEN implied by its class.
     pub fn load_elf(&mut self, elf: &crate::elf::Elf) -> Result<(), Exception> {
+        self.xlen = if elf.is_64 { Xlen::Rv64 } else { Xlen::Rv32 };
+        // The stack pointer was set for the constructor's width; re-normalise.
+        let sp = self.regs[2];
+        self.regs[2] = trunc(sp, self.xbits());
         for seg in &elf.segments {
-            self.mem.load_at(seg.addr as u64, &seg.data)?;
+            self.mem.load_at(seg.addr, &seg.data)?;
             if seg.zero_len > 0 {
                 self.mem
-                    .zero(seg.addr as u64 + seg.data.len() as u64, seg.zero_len as u64)?;
+                    .zero(seg.addr + seg.data.len() as u64, seg.zero_len)?;
             }
         }
         self.pc = elf.entry;
-        self.mem.tohost = elf.symbols.get("tohost").map(|&a| a as u64);
+        self.mem.tohost = elf.symbols.get("tohost").copied();
         Ok(())
     }
 
@@ -330,7 +450,7 @@ impl Cpu {
                 // Bit 0 set means "terminate"; the rest is the payload's status,
                 // where 0 is success and n identifies the failing test case.
                 if v & 1 == 1 {
-                    return match (v >> 1) as u32 {
+                    return match v >> 1 {
                         0 => Exit::Pass,
                         n => Exit::Fail(n),
                     };

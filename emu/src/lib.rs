@@ -10,7 +10,7 @@ pub mod elf;
 pub mod memory;
 pub mod trap;
 
-pub use cpu::{Cpu, Exit};
+pub use cpu::{Cpu, Exit, Xlen};
 pub use elf::Elf;
 pub use memory::DRAM_BASE;
 pub use trap::Exception;

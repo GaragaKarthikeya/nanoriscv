@@ -15,7 +15,7 @@ const MEM: usize = 1 << 20;
 
 /// Runs a program to its ECALL and returns the final hart state.
 fn run(prog: &[u32]) -> Cpu {
-    let mut cpu = Cpu::new(MEM);
+    let mut cpu = Cpu::rv32(MEM);
     cpu.mem.load(&image(prog));
     for _ in 0..10_000 {
         match cpu.step() {
@@ -58,7 +58,7 @@ fn lui_and_auipc() {
     // AUIPC adds to the address of the AUIPC itself, not the next instruction.
     let cpu = run(&[lui(10, 0xdead_0000), auipc(11, 0x0000_1000), ECALL]);
     assert_eq!(cpu.regs[10], 0xdead_0000);
-    assert_eq!(cpu.regs[11], DRAM_BASE as u32 + 4 + 0x1000);
+    assert_eq!(cpu.regs[11], DRAM_BASE + 4 + 0x1000);
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn jal_links_and_jumps_backwards() {
     ];
     let cpu = run(&prog);
     assert_eq!(cpu.regs[10], 1);
-    assert_eq!(cpu.regs[1], DRAM_BASE as u32 + 8); // return address
+    assert_eq!(cpu.regs[1], DRAM_BASE + 8); // return address
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn shift_right_arithmetic_versus_logical() {
     ];
     let cpu = run(&prog);
     assert_eq!(cpu.regs[10], 0x7fff_fffc);
-    assert_eq!(cpu.regs[11], (-4i32) as u32);
+    assert_eq!(cpu.regs[11], (-4i32) as u32 as u64);
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn csrrs_with_rs1_zero_does_not_write() {
 #[test]
 fn an_illegal_instruction_traps_to_mtvec() {
     let handler = DRAM_BASE as u32 + 0x100;
-    let mut cpu = Cpu::new(MEM);
+    let mut cpu = Cpu::rv32(MEM);
     cpu.mem.load(&image(&[
         lui(5, handler),
         addi(5, 5, (handler & 0xfff) as i32),
@@ -258,14 +258,14 @@ fn an_illegal_instruction_traps_to_mtvec() {
         cpu.step().expect("setup should not trap");
     }
     assert!(matches!(cpu.step(), Err(Exception::IllegalInstruction(_))));
-    assert_eq!(cpu.pc, handler);
+    assert_eq!(cpu.pc, handler as u64);
     assert_eq!(cpu.csrs.read(nanoemu::csr::MCAUSE), 2);
     assert_eq!(cpu.csrs.read(nanoemu::csr::MEPC), DRAM_BASE + 12);
 }
 
 #[test]
 fn a_load_outside_dram_faults() {
-    let mut cpu = Cpu::new(MEM);
+    let mut cpu = Cpu::rv32(MEM);
     // lw x10, 0(x0) -> address 0, well below DRAM_BASE
     cpu.mem.load(&image(&[lw(10, 0, 0)]));
     assert!(matches!(cpu.step(), Err(Exception::LoadAccessFault(0))));

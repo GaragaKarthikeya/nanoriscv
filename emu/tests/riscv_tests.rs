@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use nanoemu::cpu::{Cpu, Exit};
+use nanoemu::cpu::{Cpu, Exit, Xlen};
 use nanoemu::elf::Elf;
 
 /// 64 MiB, matching the CLI, so a test that runs here runs there.
@@ -42,7 +42,8 @@ fn binaries() -> Vec<PathBuf> {
 fn run_one(path: &Path) -> Exit {
     let bytes = std::fs::read(path).expect("test binary is readable");
     let elf = Elf::parse(&bytes).expect("test binary is a valid RV32 ELF");
-    let mut cpu = Cpu::new(MEM);
+    // The width comes from the ELF class, so one runner covers both suites.
+    let mut cpu = Cpu::new(MEM, Xlen::Rv64);
     cpu.load_elf(&elf).expect("test binary fits in memory");
     assert!(
         cpu.mem.tohost.is_some(),
@@ -97,4 +98,14 @@ fn rv32ui_base_integer_suite() {
 #[test]
 fn rv32um_mul_div_suite() {
     run_suite("rv32um-p-");
+}
+
+#[test]
+fn rv64ui_base_integer_suite() {
+    run_suite("rv64ui-p-");
+}
+
+#[test]
+fn rv64um_mul_div_suite() {
+    run_suite("rv64um-p-");
 }
