@@ -3,6 +3,7 @@
 //! Its job is to be obviously correct rather than fast: it is the golden model
 //! the SystemVerilog core is checked against, instruction by instruction.
 
+pub mod compress;
 pub mod cpu;
 pub mod csr;
 pub mod decode;

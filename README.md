@@ -15,17 +15,21 @@ disagree.
 
 ## Status
 
-**RV32IM and RV64IM both pass the official riscv-tests suite: 117/117.**
+**RV32IMAC and RV64IMAC pass the official riscv-tests suite: 148/148.**
 
 | Suite | Tests |
 | --- | --- |
-| `rv32ui` / `rv32um` | 42 + 8 |
-| `rv64ui` / `rv64um` | 54 + 13 |
-| hand-written (`rv32im.rs`, `rv64.rs`) | 21 + 13 |
+| `rv32ui` / `rv32um` / `rv32ua` / `rv32uc` | 42 + 8 + 10 + 1 |
+| `rv64ui` / `rv64um` / `rv64ua` / `rv64uc` | 54 + 13 + 19 + 1 |
+| hand-written (`rv32im.rs`, `rv64.rs`, `ac.rs`) | 21 + 13 + 18 |
 
-Still missing before the emulator is "complete" in the RV64GC sense: the A
-(atomics), C (compressed) and F/D (floating point) extensions, supervisor mode
-with Sv39 paging, and the CLINT/PLIC/UART devices a Linux boot needs.
+Five upstream tests are skipped by name in `tests/riscv_tests.rs`: the
+`amocas` ones are **Zacas**, a separate extension from A, which upstream
+happens to file in the `ua` directory.
+
+Still missing before the emulator is "complete" in the RV64GC sense: F and D
+(floating point), supervisor mode with Sv39 paging, and the CLINT/PLIC/UART
+devices a Linux boot needs.
 
 ```
 make docs        # fetch specs, encodings and riscv-tests (once, after cloning)
@@ -56,10 +60,13 @@ emu/         the Rust simulator (crate: nanoemu)
   src/cpu.rs      the hart: fetch, execute, trap, and the run loop
   src/csr.rs      machine-mode control and status registers
   src/memory.rs   flat little-endian DRAM at 0x8000_0000
+  src/compress.rs the C extension, expanded to base instructions at fetch
   src/elf.rs      ELF32/ELF64 loader and symbol lookup
   src/trap.rs     exception causes
   tests/rv32im.rs      hand-written RV32 tests, one per spec corner
   tests/rv64.rs        RV64 behaviour and the dual-width seams
+  tests/ac.rs          the A and C extensions
+  examples/diag.rs     prints the first unexpected trap in a test binary
   tests/riscv_tests.rs the official rv32/rv64 ui and um suites
 rtl/         the SystemVerilog core (not started — see rtl/README.md)
 docs/        specs, encodings, riscv-tests (gitignored; see docs/README.md)
@@ -75,6 +82,20 @@ cached, because this model's only job is to be obviously right. When the RTL
 core arrives, `step()` is the unit the testbench compares against — after each
 one, the core's retire-stage state must match `pc`, `x1..x31` and the machine
 CSRs exactly.
+
+### C is expanded, not executed
+
+Every RVC instruction is defined by the spec as an alias for exactly one base
+instruction, so `src/compress.rs` expands each 16-bit word at fetch and the
+execute path never learns that C exists. Nothing downstream grows a second
+case, and the RTL core can use the same trick.
+
+Two consequences worth stating. Instructions now need only 2-byte alignment,
+so the fetch check is `pc & 1` rather than `pc & 3` — requiring 4 would reject
+perfectly legal jump targets. And the RVC immediate fields are scrambled
+rather than contiguous, which looks gratuitous on paper but keeps each bit in
+a fixed position relative to the 32-bit encodings, so hardware routes wires
+instead of multiplexing.
 
 ### One ALU, two widths
 
@@ -131,6 +152,16 @@ These all have tests, because each one was worth a test:
   `Elf64_Shdr` it really is at 40, and ELF64 reorders the program header too.)
 - `MULHSU` is signed `rs1` times *unsigned* `rs2`. Taking the unsigned operand
   from `rs1` passes every other multiply test and fails only this one.
+- `SRAI` is selected by funct6 `0b010000`, which sits in `imm[11:6]` — that is
+  `0x400`, not funct7's `0x20` shifted up by six. Getting it wrong produces a
+  plausible instruction that decodes as illegal.
+- The same halfword means different things at different widths: `0x2505` is
+  `C.ADDIW` on RV64 and `C.JAL` on RV32. A decompressor that ignores XLEN is
+  silently wrong rather than visibly broken.
+- An all-zero halfword must be illegal, so that execution running into a
+  zeroed page traps instead of wandering.
+- An AMO returns the value that was in memory *beforehand*, and unlike
+  ordinary loads and stores it must be naturally aligned.
 - On RV64, `LUI` sign-extends. Every address at or above `0x8000_0000` has bit
   31 set, so `lui` cannot be used to build a DRAM address — it lands at the top
   of the address space instead.

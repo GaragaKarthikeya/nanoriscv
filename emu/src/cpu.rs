@@ -11,6 +11,7 @@
 //! written once and parameterised by a `width` -- 32 or 64 -- rather than
 //! duplicated per extension.
 
+use crate::compress::decompress;
 use crate::csr::{self, CsrFile};
 use crate::decode::*;
 use crate::memory::{Memory, DRAM_BASE};
@@ -62,6 +63,10 @@ pub struct Cpu {
     pub csrs: CsrFile,
     pub mem: Memory,
     pub cycle: u64,
+    /// The address reserved by the most recent LR, if any. A single hart never
+    /// has a reservation broken by someone else, so SC fails only when there
+    /// was no LR or it named a different address.
+    pub reservation: Option<u64>,
 }
 
 impl Cpu {
@@ -73,6 +78,7 @@ impl Cpu {
             csrs: CsrFile::new(),
             mem: Memory::new(mem_size),
             cycle: 0,
+            reservation: None,
         };
         // Stack pointer starts at the top of DRAM, as a bare-metal ABI expects.
         cpu.regs[2] = DRAM_BASE + mem_size as u64;
@@ -115,14 +121,25 @@ impl Cpu {
         sext(self.rr(r), self.xbits()) as i64
     }
 
-    fn fetch(&self) -> Result<u32, Exception> {
-        if self.pc & 0x3 != 0 {
+    /// Fetches one instruction and reports its encoded length in bytes.
+    ///
+    /// A compressed instruction is expanded here, so nothing downstream needs
+    /// to know that C exists. With C implemented, instructions need only
+    /// 2-byte alignment -- requiring 4 would reject perfectly legal targets.
+    fn fetch(&self) -> Result<(u32, u64), Exception> {
+        if self.pc & 0x1 != 0 {
             return Err(Exception::InstructionAccessFault(self.pc));
         }
-        self.mem
-            .read(self.pc, 4)
-            .map(|v| v as u32)
-            .map_err(|_| Exception::InstructionAccessFault(self.pc))
+        let fault = |_| Exception::InstructionAccessFault(self.pc);
+        let lo = self.mem.read(self.pc, 2).map_err(fault)? as u32;
+        // Both low bits set means a 32-bit encoding; anything else is
+        // compressed. Vol I, "Base Instruction-Length Encoding".
+        if lo & 0x3 != 0x3 {
+            let expanded = decompress(lo, self.xlen).ok_or(Exception::IllegalInstruction(lo))?;
+            return Ok((expanded, 2));
+        }
+        let hi = self.mem.read(self.pc + 2, 2).map_err(fault)? as u32;
+        Ok(((hi << 16) | lo, 4))
     }
 
     /// Fetches, executes and retires one instruction. On an exception the trap
@@ -134,9 +151,9 @@ impl Cpu {
 
         // Held across execute(), which advances self.pc before it can fault.
         let inst_pc = self.pc;
-        let result = self.fetch().and_then(|inst| {
-            let next = self.pc.wrapping_add(4);
-            self.execute(inst, next)
+        let result = self.fetch().and_then(|(inst, len)| {
+            let next = self.pc.wrapping_add(len);
+            self.execute(inst, inst_pc, next)
         });
 
         match result {
@@ -164,12 +181,11 @@ impl Cpu {
         self.pc = self.csrs.read(csr::MTVEC) & !0x3;
     }
 
-    fn execute(&mut self, inst: u32, next_pc: u64) -> Result<(), Exception> {
+    fn execute(&mut self, inst: u32, inst_pc: u64, next_pc: u64) -> Result<(), Exception> {
         let (rd, rs1, rs2) = (rd(inst), rs1(inst), rs2(inst));
         let (f3, f7) = (funct3(inst), funct7(inst));
         let xb = self.xbits();
         let illegal = Err(Exception::IllegalInstruction(inst));
-        let inst_pc = next_pc.wrapping_sub(4);
         self.pc = next_pc;
 
         match opcode(inst) {
@@ -277,6 +293,66 @@ impl Cpu {
                     }
                 };
                 self.wr(rd, v);
+            }
+            // AMO: the A extension.
+            0x2f => {
+                let width = match f3 {
+                    0x2 => 32,
+                    0x3 if xb == 64 => 64,
+                    _ => return illegal,
+                };
+                let size = width as u64 / 8;
+                let addr = self.rr(rs1);
+                // Atomics must be naturally aligned; unlike ordinary loads and
+                // stores there is no misaligned fallback for them.
+                if !addr.is_multiple_of(size) {
+                    return Err(Exception::StoreAddressMisaligned(addr));
+                }
+                // The aq and rl bits occupy funct7[1:0]; ordering is a no-op
+                // on one in-order hart, so only funct5 selects the operation.
+                match f7 >> 2 {
+                    // LR
+                    0x02 => {
+                        if rs2 != 0 {
+                            return illegal;
+                        }
+                        let v = sext(self.mem.read(addr, size)?, width);
+                        self.reservation = Some(addr);
+                        self.wr(rd, v);
+                    }
+                    // SC. Writes 0 to rd on success and 1 on failure, and
+                    // clears the reservation either way.
+                    0x03 => {
+                        let ok = self.reservation == Some(addr);
+                        if ok {
+                            self.mem.write(addr, size, self.rr(rs2))?;
+                        }
+                        self.reservation = None;
+                        self.wr(rd, !ok as u64);
+                    }
+                    op => {
+                        let old = self.mem.read(addr, size)?;
+                        let a = sext(old, width);
+                        let b = self.rr(rs2);
+                        let (sa, sb) = (a as i64, sext(b, width) as i64);
+                        let (ua, ub) = (trunc(a, width), trunc(b, width));
+                        let new = match op {
+                            0x00 => a.wrapping_add(b), // AMOADD
+                            0x01 => b,                 // AMOSWAP
+                            0x04 => a ^ b,             // AMOXOR
+                            0x08 => a | b,             // AMOOR
+                            0x0c => a & b,             // AMOAND
+                            0x10 => sa.min(sb) as u64, // AMOMIN
+                            0x14 => sa.max(sb) as u64, // AMOMAX
+                            0x18 => ua.min(ub),        // AMOMINU
+                            0x1c => ua.max(ub),        // AMOMAXU
+                            _ => return illegal,
+                        };
+                        self.mem.write(addr, size, new)?;
+                        // rd gets the value that was in memory beforehand.
+                        self.wr(rd, a);
+                    }
+                }
             }
             // MISC-MEM: FENCE and FENCE.I are no-ops on a single in-order hart.
             0x0f => {}

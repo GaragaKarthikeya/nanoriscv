@@ -19,8 +19,12 @@ fi
 # zicsr and zifencei have been separate extensions since GCC 12, and GCC 14
 # rejects a csrr whose extension is not named in -march. Clang is lenient about
 # it; spelling them out keeps one flag string working for both.
-ISA32=rv32im_zicsr_zifencei
-ISA64=rv64im_zicsr_zifencei
+ISA32=rv32ima_zicsr_zifencei
+ISA64=rv64ima_zicsr_zifencei
+# The C suites need compressed encodings emitted; the others are built
+# without C so that they keep testing the 32-bit encodings.
+ISA32C=rv32imac_zicsr_zifencei
+ISA64C=rv64imac_zicsr_zifencei
 
 GNU=riscv64-unknown-elf-gcc
 if command -v "$GNU" >/dev/null 2>&1; then
@@ -72,8 +76,12 @@ build_suite() { # <suite dir name> <march> <mabi>
 
 build_suite rv32ui "$ISA32" ilp32
 build_suite rv32um "$ISA32" ilp32
+build_suite rv32ua "$ISA32" ilp32
+build_suite rv32uc "$ISA32C" ilp32
 build_suite rv64ui "$ISA64" lp64
 build_suite rv64um "$ISA64" lp64
+build_suite rv64ua "$ISA64" lp64
+build_suite rv64uc "$ISA64C" lp64
 
 echo "built $built test binaries into $OUT${failed:+, $failed failed}"
 [ "$failed" -eq 0 ]

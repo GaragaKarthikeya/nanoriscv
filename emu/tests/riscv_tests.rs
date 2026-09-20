@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 use nanoemu::cpu::{Cpu, Exit, Xlen};
 use nanoemu::elf::Elf;
 
+/// Tests that exercise an extension this emulator does not implement.
+///
+/// Upstream files the `amocas` tests under `ua`, but compare-and-swap is
+/// Zacas, a separate extension from A (which is Zalrsc plus Zaamo). They are
+/// named here rather than filtered by a pattern so that adding Zacas later
+/// means deleting three lines and watching them go green.
+const UNIMPLEMENTED: &[&str] = &[
+    "rv32ua-p-amocas_w",
+    "rv32ua-p-amocas_d",
+    "rv64ua-p-amocas_w",
+    "rv64ua-p-amocas_d",
+    "rv64ua-p-amocas_q",
+];
+
 /// 64 MiB, matching the CLI, so a test that runs here runs there.
 const MEM: usize = 64 * 1024 * 1024;
 /// Generous enough for every test in the suite; only a hang exceeds it.
@@ -72,8 +86,13 @@ fn run_suite(prefix: &str) {
     // hide the others -- knowing whether one test or thirty broke is the
     // difference between a typo and a wrong idea.
     let mut failures = Vec::new();
+    let mut skipped = 0;
     for path in &binaries {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if UNIMPLEMENTED.contains(&name.as_str()) {
+            skipped += 1;
+            continue;
+        }
         match run_one(path) {
             Exit::Pass => {}
             other => failures.push(format!("{name}: {other:?}")),
@@ -84,10 +103,15 @@ fn run_suite(prefix: &str) {
         failures.is_empty(),
         "{} of {} {prefix} tests failed:\n  {}",
         failures.len(),
-        binaries.len(),
+        binaries.len() - skipped,
         failures.join("\n  ")
     );
-    eprintln!("{prefix}: {} tests passed", binaries.len());
+    let note = if skipped > 0 {
+        format!(" ({skipped} skipped: unimplemented extension)")
+    } else {
+        String::new()
+    };
+    eprintln!("{prefix}: {} tests passed{note}", binaries.len() - skipped);
 }
 
 #[test]
@@ -108,4 +132,24 @@ fn rv64ui_base_integer_suite() {
 #[test]
 fn rv64um_mul_div_suite() {
     run_suite("rv64um-p-");
+}
+
+#[test]
+fn rv32ua_atomics_suite() {
+    run_suite("rv32ua-p-");
+}
+
+#[test]
+fn rv64ua_atomics_suite() {
+    run_suite("rv64ua-p-");
+}
+
+#[test]
+fn rv32uc_compressed_suite() {
+    run_suite("rv32uc-p-");
+}
+
+#[test]
+fn rv64uc_compressed_suite() {
+    run_suite("rv64uc-p-");
 }
