@@ -201,10 +201,6 @@ linker script use, so upstream test binaries will load without relinking.
    - ~~F and D, for a full RV64GC~~ **Done: 43/43 on `uf` and `ud`.**
    - ~~A device tree, then a Linux boot~~ **Done: the kernel reaches
      userspace and powers off through SBI.**
-   - QEMU as a second reference, to diff against when something disagrees.
-     Not built yet; the one reference we do have for the arithmetic is the
-     host's own IEEE `f64`, which `tests/fp.rs` diffs against for the
-     round-to-nearest mode.
 4. **RTL core** — a 5-stage RV32I pipeline in SystemVerilog, verified by
    lockstep diff against milestone 1.
 5. **FPGA** — put it on the ZCU104 using the parent repo's board support.
