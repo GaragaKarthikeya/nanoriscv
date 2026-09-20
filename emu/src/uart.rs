@@ -56,6 +56,13 @@ impl Uart {
         self.rx.extend(bytes);
     }
 
+    /// Whether input is queued. Input is the one thing that appears without
+    /// the guest touching a device register, so the hart checks this to know
+    /// when its cached interrupt state has gone stale.
+    pub fn has_input(&self) -> bool {
+        !self.rx.is_empty()
+    }
+
     /// Takes one queued input byte, if any. Used by the SBI console, which
     /// reports "nothing waiting" rather than blocking.
     pub fn take_input(&mut self) -> Option<u8> {

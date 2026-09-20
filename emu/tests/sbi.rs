@@ -218,3 +218,29 @@ fn a_user_mode_ecall_is_still_a_trap() {
     assert_eq!(cpu.pc, DRAM_BASE + 0x400);
     assert_eq!(cpu.csrs.read(csr::SCAUSE), 8, "ecall from user mode");
 }
+
+/// A user-mode ecall is a syscall for the kernel, not a reason to stop.
+///
+/// The emulator ends a bare payload's run on an ecall, because a test binary
+/// with no `tohost` symbol has no other way to say it is finished. A booted
+/// kernel has no `tohost` either, so without the privilege check that rule
+/// swallowed the first syscall userspace ever made -- the run ended at the
+/// instant it became interesting.
+#[test]
+fn a_user_syscall_does_not_end_the_run() {
+    let mut cpu = sbi_cpu_prog(&[ECALL, addi(0, 0, 0), addi(0, 0, 0)], 0, 0, 0, 0);
+    cpu.priv_mode = Priv::User;
+    cpu.csrs.write(csr::STVEC, DRAM_BASE + 0x400);
+    cpu.mem
+        .load_at(DRAM_BASE + 0x400, &image(&[addi(0, 0, 0); 4]))
+        .unwrap();
+    assert_eq!(cpu.mem.tohost, None, "a kernel Image declares no tohost");
+
+    assert_eq!(cpu.run(2), Exit::StepLimit, "the run kept going");
+    assert_eq!(
+        cpu.pc & !0x3,
+        DRAM_BASE + 0x400 + 4,
+        "the kernel handled it"
+    );
+    assert_eq!(cpu.csrs.read(csr::SCAUSE), 8, "ecall from user mode");
+}

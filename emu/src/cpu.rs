@@ -61,6 +61,11 @@ fn trunc(v: u64, width: u32) -> u64 {
 /// not thrash, small enough to stay in the host's cache.
 const TLB_ENTRIES: usize = 1024;
 
+/// How often the device interrupt state is swept even with no device access.
+/// Only external input needs this, and a few hundred instructions of latency
+/// on a keystroke is below anything a guest can notice.
+const DEVICE_POLL_INTERVAL: u64 = 256;
+
 /// The `mstatus` bits a translation depends on: SUM and MXR change what a
 /// supervisor access is allowed to reach, and MPRV changes which privilege
 /// the access is made at.
@@ -276,9 +281,28 @@ impl Cpu {
         if self.pc & 0x1 != 0 {
             return Err(Exception::InstructionAddressMisaligned(self.pc));
         }
-        let lo = self.fetch_half(self.pc)? as u32;
         // Both low bits set means a 32-bit encoding; anything else is
         // compressed. Vol I, "Base Instruction-Length Encoding".
+        //
+        // When all four bytes are on the same page the fetch is one
+        // translation and one read, which is the case for all but one
+        // instruction in a thousand.
+        if self.pc & 0xfff <= 0xffc {
+            let pa = self.translate(self.pc, Access::Fetch)?;
+            let word = self
+                .mem
+                .read(pa, 4)
+                .map_err(|_| Exception::InstructionAccessFault(self.pc))?
+                as u32;
+            if word & 0x3 != 0x3 {
+                let lo = word & 0xffff;
+                let expanded =
+                    decompress(lo, self.xlen).ok_or(Exception::IllegalInstruction(lo))?;
+                return Ok((expanded, 2));
+            }
+            return Ok((word, 4));
+        }
+        let lo = self.fetch_half(self.pc)? as u32;
         if lo & 0x3 != 0x3 {
             let expanded = decompress(lo, self.xlen).ok_or(Exception::IllegalInstruction(lo))?;
             return Ok((expanded, 2));
@@ -374,6 +398,17 @@ impl Cpu {
         // Devices assert their lines into the PLIC, which decides whether a
         // context has anything worth interrupting for. The external-interrupt
         // bits are driven entirely from here, never written by software.
+        //
+        // Nothing here can change unless a device register was touched, so
+        // the scan runs then rather than on every instruction. The periodic
+        // sweep covers input arriving from outside the guest.
+        if !self.mem.devices_dirty
+            && !self.mem.uart.has_input()
+            && !self.cycle.is_multiple_of(DEVICE_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.mem.devices_dirty = false;
         let uart_active = self.mem.uart.is_interrupting();
         self.mem.plic.set_level(uart::UART_IRQ, uart_active);
         for (context, bit) in [
@@ -1028,7 +1063,13 @@ impl Cpu {
             }
             match r {
                 Ok(()) => {}
-                Err(Exception::EnvironmentCall) if self.mem.tohost.is_none() => return Exit::Ecall,
+                // A bare payload with no `tohost` has no other way to say
+                // it is finished, so its ecall ends the run. Under SBI an
+                // ecall is ordinary traffic -- every userspace syscall is
+                // one -- and the kernel's handler deals with it.
+                Err(Exception::EnvironmentCall) if !self.sbi && self.mem.tohost.is_none() => {
+                    return Exit::Ecall
+                }
                 Err(e) if self.no_handler() => return Exit::UnhandledTrap(e),
                 Err(_) => {}
             }

@@ -59,6 +59,10 @@ pub struct Memory {
     pub tohost: Option<u64>,
     /// Last value written to `tohost`; `Some(0)` never occurs (0 means "running").
     pub tohost_value: Option<u64>,
+    /// Set whenever a device register is touched, so that the interrupt
+    /// state, which only a device can change, is recomputed then rather than
+    /// after every instruction.
+    pub devices_dirty: bool,
 }
 
 impl Memory {
@@ -70,6 +74,7 @@ impl Memory {
             uart: Uart::default(),
             tohost: None,
             tohost_value: None,
+            devices_dirty: true,
         }
     }
 
@@ -107,6 +112,20 @@ impl Memory {
     /// PLIC's claim register hands back an interrupt *and* claims it, and
     /// reading the UART consumes a byte.
     pub fn read(&mut self, addr: u64, size: u64) -> Result<u64, Unmapped> {
+        // DRAM is checked first and every device sits below it, so the common
+        // case costs one comparison. This is on the path of every fetch.
+        if addr >= DRAM_BASE {
+            let i = self.index(addr, size).ok_or(Unmapped)?;
+            let d = &self.dram[i..];
+            return Ok(match size {
+                1 => d[0] as u64,
+                2 => u16::from_le_bytes([d[0], d[1]]) as u64,
+                4 => u32::from_le_bytes(d[..4].try_into().unwrap()) as u64,
+                8 => u64::from_le_bytes(d[..8].try_into().unwrap()),
+                _ => return Err(Unmapped),
+            });
+        }
+        self.devices_dirty = true;
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             return Ok(self.clint_read(addr, size));
         }
@@ -116,15 +135,25 @@ impl Memory {
         if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
             return Ok(self.uart.read(addr - UART_BASE));
         }
-        let i = self.index(addr, size).ok_or(Unmapped)?;
-        let mut v = 0u64;
-        for b in (0..size as usize).rev() {
-            v = (v << 8) | self.dram[i + b] as u64;
-        }
-        Ok(v)
+        Err(Unmapped)
     }
 
     pub fn write(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Unmapped> {
+        if addr >= DRAM_BASE {
+            let i = self.index(addr, size).ok_or(Unmapped)?;
+            let bytes = value.to_le_bytes();
+            match size {
+                1 | 2 | 4 | 8 => {
+                    self.dram[i..i + size as usize].copy_from_slice(&bytes[..size as usize])
+                }
+                _ => return Err(Unmapped),
+            }
+            if self.tohost == Some(addr) && value != 0 {
+                self.tohost_value = Some(value);
+            }
+            return Ok(());
+        }
+        self.devices_dirty = true;
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             self.clint_write(addr, size, value);
             return Ok(());
@@ -137,14 +166,7 @@ impl Memory {
             self.uart.write(addr - UART_BASE, value);
             return Ok(());
         }
-        let i = self.index(addr, size).ok_or(Unmapped)?;
-        for b in 0..size as usize {
-            self.dram[i + b] = (value >> (8 * b)) as u8;
-        }
-        if self.tohost == Some(addr) && value != 0 {
-            self.tohost_value = Some(value);
-        }
-        Ok(())
+        Err(Unmapped)
     }
 
     /// The CLINT's registers are 32- or 64-bit; a narrower access reads the

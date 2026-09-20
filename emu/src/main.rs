@@ -1,6 +1,7 @@
 //! Runs a RISC-V payload.
 //!
 //!     nanoemu <image> [--rv32|--rv64] [--trace] [--max-steps N] [--quiet]
+//!                     [--sample N]
 //!     nanoemu --kernel <Image> --dtb <file.dtb> [--mem MiB]
 //!
 //! A bare image is an ELF executable, or a flat binary loaded at DRAM_BASE if
@@ -28,12 +29,16 @@ struct Options {
     mem_mib: usize,
     xlen: Xlen,
     trace: bool,
+    /// Print where the hart is every this many steps, or 0 to stay quiet.
+    sample: u64,
     quiet: bool,
     max_steps: u64,
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: nanoemu <image> [--rv32|--rv64] [--trace] [--max-steps N] [--quiet]");
+    eprintln!(
+        "usage: nanoemu <image> [--rv32|--rv64] [--trace] [--max-steps N] [--quiet] [--sample N]"
+    );
     eprintln!("       nanoemu --kernel <Image> --dtb <file.dtb> [--mem MiB] [--max-steps N]");
     ExitCode::from(2)
 }
@@ -46,6 +51,7 @@ fn parse() -> Result<Options, ExitCode> {
         mem_mib: 0,
         xlen: Xlen::Rv64,
         trace: false,
+        sample: 0,
         quiet: false,
         max_steps: DEFAULT_MAX_STEPS,
     };
@@ -69,6 +75,11 @@ fn parse() -> Result<Options, ExitCode> {
                 o.xlen = Xlen::Rv64;
                 Ok(())
             }
+            "--sample" => value().and_then(|v| {
+                v.parse()
+                    .map(|n| o.sample = n)
+                    .map_err(|_| "--sample wants a number of steps".into())
+            }),
             "--kernel" => value().map(|v| o.kernel = Some(v)),
             "--dtb" => value().map(|v| o.dtb = Some(v)),
             "--mem" => value().and_then(|v| {
@@ -189,8 +200,28 @@ fn boot_kernel(cpu: &mut Cpu, kernel: &str, dtb: Option<&str>, mem: u64) -> Resu
 }
 
 fn run(cpu: &mut Cpu, o: &Options) -> Exit {
-    if !o.trace {
+    if !o.trace && o.sample == 0 {
         return cpu.run(o.max_steps);
+    }
+    // Sampling: run in bursts and report where the hart is between them. A
+    // full trace is far too much output to read on a kernel boot, but a
+    // periodic pc is enough to tell a slow phase from a stuck one, and to
+    // look the address up in System.map.
+    if !o.trace {
+        let mut done = 0;
+        while done < o.max_steps {
+            let burst = o.sample.min(o.max_steps - done);
+            let outcome = cpu.run(burst);
+            done += burst;
+            eprintln!(
+                "[sample] {done} steps: pc={:#x} mode={:?} mtime={}",
+                cpu.pc, cpu.priv_mode, cpu.mem.clint.mtime
+            );
+            if outcome != Exit::StepLimit {
+                return outcome;
+            }
+        }
+        return Exit::StepLimit;
     }
     // Tracing needs per-step control, so the run loop is unrolled here.
     let width = (cpu.xlen.bits() / 4) as usize;

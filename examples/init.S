@@ -22,6 +22,17 @@ _start:
 	li	a2, message_len
 	ecall
 
+	/* Power the machine off: the kernel turns this into an SBI system
+	   reset, which the emulator answers by stopping. The whole path --
+	   userspace to kernel to firmware to emulator -- closes here. */
+	li	a7, 142			/* __NR_reboot */
+	li	a0, 0xfee1dead		/* LINUX_REBOOT_MAGIC1 */
+	li	a1, 672274793		/* LINUX_REBOOT_MAGIC2 */
+	li	a2, 0x4321fedc		/* LINUX_REBOOT_CMD_POWER_OFF */
+	li	a3, 0
+	ecall
+
+	/* Only reached if the reboot was refused. */
 	li	a7, 93			/* __NR_exit */
 	li	a0, 0
 	ecall
