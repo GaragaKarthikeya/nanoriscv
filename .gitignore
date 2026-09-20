@@ -1,0 +1,6 @@
+# Reference material — recreate with scripts/fetch-docs.sh
+docs/spec/*.pdf
+docs/spec/*.json
+docs/opcodes/
+
+emu/target/

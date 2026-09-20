@@ -1,0 +1,12 @@
+[package]
+name = "nanoemu"
+version = "0.1.0"
+edition = "2021"
+description = "Reference RISC-V instruction set simulator, golden model for the nanoriscv RTL core"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
