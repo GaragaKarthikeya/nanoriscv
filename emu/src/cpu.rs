@@ -56,6 +56,16 @@ fn trunc(v: u64, width: u32) -> u64 {
     }
 }
 
+/// Translation-cache size, in entries. Direct-mapped, so this is also its
+/// associativity budget: big enough that a kernel's working set of pages does
+/// not thrash, small enough to stay in the host's cache.
+const TLB_ENTRIES: usize = 1024;
+
+/// The `mstatus` bits a translation depends on: SUM and MXR change what a
+/// supervisor access is allowed to reach, and MPRV changes which privilege
+/// the access is made at.
+const TLB_STATUS_BITS: u64 = mstatus::SUM | mstatus::MXR | mstatus::MPRV;
+
 pub struct Cpu {
     /// Registers hold the zero-extended XLEN-bit value, so on RV32 they read
     /// back exactly as the 32-bit core's register file will. x0 is stored but
@@ -86,6 +96,24 @@ pub struct Cpu {
     /// own increment, so the value written is the value the *next* instruction
     /// reads. Without this a write would always come back one too high.
     wrote_instret: bool,
+    /// A direct-mapped translation cache. A page walk is three dependent
+    /// memory reads, and every fetch and every load or store needs one, so
+    /// without this the walker dominates the emulator's running time.
+    tlb: Vec<[TlbEntry; 3]>,
+}
+
+/// One cached translation. The tag carries everything the walk depended on
+/// besides the page tables themselves -- the root pointer, the privilege, and
+/// the `mstatus` bits that change what is permitted -- so a change to any of
+/// them misses rather than returning a stale mapping. Changes to the page
+/// table *contents* are covered by SFENCE.VMA, which flushes.
+#[derive(Clone, Copy, Default)]
+struct TlbEntry {
+    valid: bool,
+    vpn: u64,
+    ppn: u64,
+    satp: u64,
+    ctx: u64,
 }
 
 impl Cpu {
@@ -98,6 +126,7 @@ impl Cpu {
             mem: Memory::new(mem_size),
             cycle: 0,
             reservation: None,
+            tlb: vec![[TlbEntry::default(); 3]; TLB_ENTRIES],
             priv_mode: Priv::Machine,
             sbi: false,
             timer_armed: false,
@@ -154,7 +183,38 @@ impl Cpu {
             self.priv_mode,
             self.xlen,
         );
-        mmu::translate(&mut self.mem, xlen, satp, status, mode, va, access)
+        let vpn = va >> 12;
+        let ctx = (status & TLB_STATUS_BITS) | mode as u64;
+        // Each access kind gets its own way. They share a page constantly --
+        // every instruction fetches, and most also load -- so indexing on the
+        // page alone would make fetch and load evict each other every step.
+        let way = access as usize;
+        let slot = (vpn as usize) & (TLB_ENTRIES - 1);
+        let e = self.tlb[slot][way];
+        if e.valid && e.vpn == vpn && e.satp == satp && e.ctx == ctx {
+            return Ok(e.ppn | (va & 0xfff));
+        }
+        let pa = mmu::translate(&mut self.mem, xlen, satp, status, mode, va, access)?;
+        // Only successful walks are cached: a fault has to be re-taken every
+        // time, since the kernel may have fixed the mapping in between.
+        self.tlb[slot][way] = TlbEntry {
+            valid: true,
+            vpn,
+            ppn: pa & !0xfff,
+            satp,
+            ctx,
+        };
+        Ok(pa)
+    }
+
+    /// Drops every cached translation. Called for SFENCE.VMA, which is the
+    /// guest's promise that it has finished editing the page tables.
+    fn flush_tlb(&mut self) {
+        for slot in &mut self.tlb {
+            for e in slot {
+                e.valid = false;
+            }
+        }
     }
 
     /// Reads memory through the MMU.
@@ -163,8 +223,6 @@ impl Cpu {
     /// that straddles a page boundary is split byte by byte, because the two
     /// halves may map to unrelated physical pages -- or the second may not be
     /// mapped at all, which has to fault rather than read the first page twice.
-    /// Reads one byte of guest memory at the current privilege, for the SBI
-    /// calls that take a pointer.
     fn read_mem(&mut self, va: u64, size: u64) -> Result<u64, Exception> {
         if (va & 0xfff) + size <= 0x1000 {
             let pa = self.translate(va, Access::Load)?;
@@ -698,8 +756,10 @@ impl Cpu {
                             return illegal;
                         }
                     }
-                    // SFENCE.VMA. Nothing is cached, so the fence is a no-op,
-                    // but TVM must still trap it in supervisor mode.
+                    // SFENCE.VMA. TVM traps it in supervisor mode; otherwise
+                    // it drops the translation cache. The address and ASID
+                    // operands are ignored: flushing everything is always a
+                    // correct implementation of a narrower fence.
                     v if v >> 5 == 0x09 => {
                         let status = self.csrs.read(csr::MSTATUS);
                         if self.priv_mode < Priv::Supervisor
@@ -707,6 +767,7 @@ impl Cpu {
                         {
                             return illegal;
                         }
+                        self.flush_tlb();
                     }
                     _ => return illegal,
                 },

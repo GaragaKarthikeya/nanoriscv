@@ -451,3 +451,42 @@ fn an_unsupported_satp_mode_does_not_stick() {
     cpu.csrs.write(csr::SATP, 0);
     assert_eq!(cpu.csrs.read(csr::SATP), 0);
 }
+
+/// SFENCE.VMA is the only thing that makes a page table edit visible.
+///
+/// The emulator caches translations, so this is not a formality: without the
+/// flush a kernel would keep using a mapping it has already torn down. The
+/// test deliberately says nothing about what happens *before* the fence --
+/// the architecture leaves that unspecified, and pinning it down would lock
+/// in an implementation detail.
+#[test]
+fn sfence_vma_makes_a_page_table_edit_take_effect() {
+    // SFENCE.VMA with both operands x0: flush everything.
+    const SFENCE_VMA: u32 = 0x1200_0073;
+
+    let mut cpu = cpu_with(&[lw(5, 6, 0), SFENCE_VMA, lw(5, 6, 0)]);
+    let satp = map_gigapage(&mut cpu, PTE_V | PTE_R | PTE_W | PTE_X);
+    cpu.csrs.force(csr::SATP, satp);
+    cpu.priv_mode = Priv::Supervisor;
+    // Nothing is delegated here, so the fault lands in machine mode.
+    cpu.csrs.force(csr::MTVEC, DRAM_BASE + 0x1000);
+    cpu.regs[6] = DRAM_BASE; // the gigapage maps DRAM to itself
+
+    cpu.run(1);
+    assert_eq!(cpu.pc, DRAM_BASE + 4, "the first load went through");
+
+    // Revoke read permission behind the emulator's back.
+    let vpn2 = (DRAM_BASE >> 30) & 0x1ff;
+    let ppn = DRAM_BASE >> 12;
+    cpu.mem
+        .write(ROOT + vpn2 * 8, 8, (ppn << 10) | PTE_V | PTE_X)
+        .unwrap();
+
+    cpu.run(2); // the fence, then the load
+    assert_eq!(
+        cpu.pc,
+        DRAM_BASE + 0x1000,
+        "the load faulted to the handler"
+    );
+    assert_eq!(cpu.csrs.read(csr::MCAUSE), 13, "load page fault");
+}

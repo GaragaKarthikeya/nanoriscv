@@ -224,7 +224,15 @@ fn report(cpu: &Cpu, outcome: Exit, quiet: bool) -> ExitCode {
             1
         }
         Exit::StepLimit => {
-            eprintln!("step limit reached without terminating");
+            eprintln!(
+                "step limit reached without terminating\n  pc={:#x} mode={:?} satp={:#x} mtime={} sepc={:#x} scause={:#x}",
+                cpu.pc,
+                cpu.priv_mode,
+                cpu.csrs.read(nanoemu::csr::SATP),
+                cpu.mem.clint.mtime,
+                cpu.csrs.read(nanoemu::csr::SEPC),
+                cpu.csrs.read(nanoemu::csr::SCAUSE),
+            );
             3
         }
     };
