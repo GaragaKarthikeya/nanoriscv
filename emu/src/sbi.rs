@@ -73,7 +73,7 @@ impl Cpu {
                     self.regs[10] = 0;
                 }
                 LEGACY_CONSOLE_PUTCHAR => {
-                    self.mem.uart.write(0, args[0]);
+                    self.mem.uart.putchar(args[0] as u8);
                     self.regs[10] = 0;
                 }
                 LEGACY_CONSOLE_GETCHAR => {
@@ -141,20 +141,25 @@ impl Cpu {
 
             (EXT_SRST, 0) => return false,
 
-            // The debug console. console_write takes a buffer in supervisor
-            // memory, so the address has to be translated before it is read.
+            // The debug console. The buffer address is *physical*: the spec
+            // gives it as the low and high halves of a physical address, and
+            // the kernel passes __pa(). Walking it through the MMU works only
+            // until the kernel drops its early identity mapping, after which
+            // every console write faults and the log silently disappears.
             (EXT_DBCN, 0) => {
                 let (len, addr) = (args[0], args[1]);
+                let mut written = 0;
                 for i in 0..len {
-                    match self.read_guest_byte(addr + i) {
-                        Some(b) => self.mem.uart.write(0, b as u64),
-                        None => break,
+                    match self.mem.read(addr + i, 1) {
+                        Ok(b) => self.mem.uart.putchar(b as u8),
+                        Err(_) => break,
                     }
+                    written += 1;
                 }
-                SbiRet::ok(len)
+                SbiRet::ok(written)
             }
             (EXT_DBCN, 2) => {
-                self.mem.uart.write(0, args[0]);
+                self.mem.uart.putchar(args[0] as u8);
                 SbiRet::success()
             }
 

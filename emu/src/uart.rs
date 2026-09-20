@@ -121,20 +121,27 @@ impl Uart {
         v as u64
     }
 
+    /// Puts a byte on the wire directly, bypassing the register decode.
+    ///
+    /// The SBI console is the firmware's, not the guest's: it must keep
+    /// working whatever state the kernel has left the 16550's LCR in, and in
+    /// particular must not be swallowed as a divisor write when DLAB is set.
+    pub fn putchar(&mut self, byte: u8) {
+        self.tx.push(byte);
+        if self.echo {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&[byte]);
+            let _ = out.flush();
+        }
+    }
+
     pub fn write(&mut self, offset: u64, value: u64) {
         let value = value as u8;
         let dlab = self.lcr & LCR_DLAB != 0;
         match offset {
             RBR_THR if dlab => self.divisor_low = value,
-            RBR_THR => {
-                self.tx.push(value);
-                if self.echo {
-                    use std::io::Write;
-                    let mut out = std::io::stdout();
-                    let _ = out.write_all(&[value]);
-                    let _ = out.flush();
-                }
-            }
+            RBR_THR => self.putchar(value),
             IER if dlab => self.divisor_high = value,
             IER => self.ier = value,
             IIR_FCR => self.fcr = value,

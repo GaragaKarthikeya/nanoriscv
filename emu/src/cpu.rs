@@ -165,10 +165,6 @@ impl Cpu {
     /// mapped at all, which has to fault rather than read the first page twice.
     /// Reads one byte of guest memory at the current privilege, for the SBI
     /// calls that take a pointer.
-    pub(crate) fn read_guest_byte(&mut self, va: u64) -> Option<u8> {
-        self.read_mem(va, 1).ok().map(|v| v as u8)
-    }
-
     fn read_mem(&mut self, va: u64, size: u64) -> Result<u64, Exception> {
         if (va & 0xfff) + size <= 0x1000 {
             let pa = self.translate(va, Access::Load)?;
@@ -935,6 +931,15 @@ impl Cpu {
         self.regs[11] = dtb;
     }
 
+    /// Whether a trap would vector to address zero, meaning no handler has
+    /// been installed yet. Under SBI the emulator is the machine-mode
+    /// firmware and everything a kernel can handle is delegated, so the
+    /// vector that matters is the supervisor's.
+    fn no_handler(&self) -> bool {
+        let which = if self.sbi { csr::STVEC } else { csr::MTVEC };
+        self.csrs.read(which) == 0
+    }
+
     /// Steps until the program stops, for at most `max_steps` instructions.
     ///
     /// Traps are not stopping conditions on their own: a riscv-tests binary
@@ -963,7 +968,7 @@ impl Cpu {
             match r {
                 Ok(()) => {}
                 Err(Exception::EnvironmentCall) if self.mem.tohost.is_none() => return Exit::Ecall,
-                Err(e) if self.csrs.read(csr::MTVEC) == 0 => return Exit::UnhandledTrap(e),
+                Err(e) if self.no_handler() => return Exit::UnhandledTrap(e),
                 Err(_) => {}
             }
         }

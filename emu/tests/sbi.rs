@@ -135,9 +135,11 @@ fn the_legacy_console_reports_no_input_as_minus_one() {
 }
 
 #[test]
-fn the_debug_console_writes_a_buffer_from_supervisor_memory() {
-    // The address is a guest pointer, so it has to be read through the MMU
-    // rather than treated as a host address.
+fn the_debug_console_writes_a_buffer_from_physical_memory() {
+    // The spec gives the buffer address as the halves of a *physical*
+    // address, and the kernel passes __pa(). Translating it would work only
+    // until the kernel drops its early identity mapping, after which the
+    // whole console would go silent.
     let text = b"sbi!";
     let buf = DRAM_BASE + 0x1000;
     let mut cpu = sbi_cpu(EXT_DBCN, 0, text.len() as u64, buf);

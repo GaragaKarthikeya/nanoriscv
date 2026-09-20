@@ -215,7 +215,12 @@ fn report(cpu: &Cpu, outcome: Exit, quiet: bool) -> ExitCode {
             1
         }
         Exit::UnhandledTrap(e) => {
-            eprintln!("unhandled trap with mtvec unset: {e:?}");
+            eprintln!(
+                "unhandled trap, no handler installed: {e:?}\n  pc={:#x} mode={:?} satp={:#x}",
+                cpu.pc,
+                cpu.priv_mode,
+                cpu.csrs.read(nanoemu::csr::SATP)
+            );
             1
         }
         Exit::StepLimit => {
