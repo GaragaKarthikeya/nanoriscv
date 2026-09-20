@@ -1,0 +1,89 @@
+/*
+ * The machine nanoemu presents. Addresses match QEMU's `virt` board, so a
+ * kernel configured for that board finds everything where it expects.
+ *
+ * The ISA string deliberately omits F and D: this hart has no floating point,
+ * and advertising it would make the kernel save and restore registers that do
+ * not exist.
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "riscv-virtio";
+	model = "nanoriscv";
+
+	chosen {
+		/*
+		 * earlycon=sbi prints through the firmware before any driver is
+		 * probed, which is the only console that shows an early failure.
+		 */
+		bootargs = "console=ttyS0 earlycon=sbi";
+		stdout-path = "/soc/serial@10000000";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* One tick per retired instruction; see Cpu::tick_timer. */
+		timebase-frequency = <10000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv64imac";
+			riscv,isa-base = "rv64i";
+			riscv,isa-extensions = "i", "m", "a", "c", "zicsr", "zifencei";
+			mmu-type = "riscv,sv39";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		/* 256 MiB, matching nanoemu's default for a kernel boot. */
+		reg = <0x0 0x80000000 0x0 0x10000000>;
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		plic: interrupt-controller@c000000 {
+			compatible = "sifive,plic-1.0.0", "riscv,plic0";
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			reg = <0x0 0x0c000000 0x0 0x4000000>;
+			riscv,ndev = <31>;
+			/*
+			 * Two contexts for the one hart: machine external (11) and
+			 * supervisor external (9), in that order.
+			 */
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+		};
+
+		clint@2000000 {
+			compatible = "sifive,clint0", "riscv,clint0";
+			reg = <0x0 0x02000000 0x0 0x10000>;
+			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
+		};
+
+		serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x100>;
+			interrupt-parent = <&plic>;
+			interrupts = <10>;
+			clock-frequency = <3686400>;
+		};
+	};
+};

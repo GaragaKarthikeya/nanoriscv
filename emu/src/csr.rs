@@ -295,6 +295,23 @@ impl CsrFile {
             // misa is writable in principle but this hart has a fixed set of
             // extensions, so writes are ignored rather than allowed to lie.
             MISA => {}
+            // satp.MODE is WARL, and Linux probes for Sv57 and Sv48 by
+            // writing a mode and reading it back. An unsupported mode must
+            // leave satp unchanged, or the kernel concludes it has five-level
+            // paging and builds page tables this MMU cannot walk.
+            SATP => {
+                let mode = match self.xlen {
+                    Xlen::Rv32 => value >> 31,
+                    Xlen::Rv64 => (value >> 60) & 0xf,
+                };
+                let supported = match self.xlen {
+                    Xlen::Rv32 => mode <= 1,
+                    Xlen::Rv64 => mode == 0 || mode == 8, // Bare or Sv39
+                };
+                if supported {
+                    self.regs[SATP as usize] = value;
+                }
+            }
             MCYCLEH => {
                 let lo = self.regs[MCYCLE as usize] & 0xffff_ffff;
                 self.regs[MCYCLE as usize] = (value << 32) | lo;

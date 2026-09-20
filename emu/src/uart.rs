@@ -56,6 +56,12 @@ impl Uart {
         self.rx.extend(bytes);
     }
 
+    /// Takes one queued input byte, if any. Used by the SBI console, which
+    /// reports "nothing waiting" rather than blocking.
+    pub fn take_input(&mut self) -> Option<u8> {
+        self.rx.pop_front()
+    }
+
     /// Everything written so far, as text. Invalid UTF-8 is replaced rather
     /// than rejected, since a console carries whatever the guest emits.
     pub fn output(&self) -> String {

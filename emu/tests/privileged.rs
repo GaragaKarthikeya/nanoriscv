@@ -427,3 +427,27 @@ fn mprv_makes_machine_loads_use_the_previous_mode() {
         0x1234
     );
 }
+
+#[test]
+fn an_unsupported_satp_mode_does_not_stick() {
+    // Linux probes for Sv57 and Sv48 by writing the mode and reading it
+    // back. Accepting a mode this MMU cannot walk makes the kernel build
+    // five-level page tables and fault on its first translated access.
+    let mut cpu = cpu_with(&[]);
+    let sv39 = 8u64 << 60;
+    cpu.csrs.write(csr::SATP, sv39 | 0x1234);
+    assert_eq!(cpu.csrs.read(csr::SATP), sv39 | 0x1234);
+
+    for unsupported in [9u64, 10] {
+        cpu.csrs.write(csr::SATP, unsupported << 60);
+        assert_eq!(
+            cpu.csrs.read(csr::SATP) >> 60,
+            8,
+            "mode {unsupported} must be rejected, leaving satp alone"
+        );
+    }
+
+    // Bare is always supported.
+    cpu.csrs.write(csr::SATP, 0);
+    assert_eq!(cpu.csrs.read(csr::SATP), 0);
+}

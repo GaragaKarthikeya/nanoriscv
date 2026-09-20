@@ -73,6 +73,13 @@ pub struct Cpu {
     /// The privilege the hart is executing at. Reset leaves it in machine
     /// mode, which is the only mode guaranteed to exist.
     pub priv_mode: Priv,
+    /// Whether the emulator answers supervisor `ecall`s itself, standing in
+    /// for the machine-mode firmware a real board would run.
+    pub sbi: bool,
+    /// Whether a timer has been scheduled through SBI and not yet fired.
+    pub timer_armed: bool,
+    /// Set when the guest has asked to power off.
+    pub shutdown: bool,
     /// Set when the instruction being executed wrote `minstret` itself.
     ///
     /// Writing the retired-instruction counter suppresses that instruction's
@@ -92,6 +99,9 @@ impl Cpu {
             cycle: 0,
             reservation: None,
             priv_mode: Priv::Machine,
+            sbi: false,
+            timer_armed: false,
+            shutdown: false,
             wrote_instret: false,
         };
         // Stack pointer starts at the top of DRAM, as a bare-metal ABI expects.
@@ -153,6 +163,12 @@ impl Cpu {
     /// that straddles a page boundary is split byte by byte, because the two
     /// halves may map to unrelated physical pages -- or the second may not be
     /// mapped at all, which has to fault rather than read the first page twice.
+    /// Reads one byte of guest memory at the current privilege, for the SBI
+    /// calls that take a pointer.
+    pub(crate) fn read_guest_byte(&mut self, va: u64) -> Option<u8> {
+        self.read_mem(va, 1).ok().map(|v| v as u8)
+    }
+
     fn read_mem(&mut self, va: u64, size: u64) -> Result<u64, Exception> {
         if (va & 0xfff) + size <= 0x1000 {
             let pa = self.translate(va, Access::Load)?;
@@ -258,6 +274,15 @@ impl Cpu {
                 }
                 Ok(())
             }
+            // An ecall from supervisor mode is a call into the firmware, not
+            // a trap. self.pc already points past it, so answering here
+            // returns to the instruction after the call.
+            Err(Exception::EnvironmentCall) if self.sbi && self.priv_mode == Priv::Supervisor => {
+                if !self.handle_sbi() {
+                    self.shutdown = true;
+                }
+                Ok(())
+            }
             Err(e) => {
                 self.trap(e, inst_pc);
                 Err(e)
@@ -274,7 +299,14 @@ impl Cpu {
         self.mem.clint.mtime = self.mem.clint.mtime.wrapping_add(1);
         self.csrs.force(csr::TIME, self.mem.clint.mtime);
 
-        if self.mem.clint.mtime >= self.mem.clint.mtimecmp {
+        if self.sbi {
+            // The kernel cannot see the CLINT, so the firmware owns mtimecmp
+            // and turns its expiry into a supervisor timer interrupt.
+            if self.timer_armed && self.mem.clint.mtime >= self.mem.clint.mtimecmp {
+                self.csrs.set_bits(csr::MIP, int::STIP);
+                self.timer_armed = false;
+            }
+        } else if self.mem.clint.mtime >= self.mem.clint.mtimecmp {
             self.csrs.set_bits(csr::MIP, int::MTIP);
         } else {
             self.csrs.clear_bits(csr::MIP, int::MTIP);
@@ -849,6 +881,8 @@ pub enum Exit {
     UnhandledTrap(Exception),
     /// Ran past the step budget -- almost always an infinite loop.
     StepLimit,
+    /// The guest asked the firmware to power off.
+    Shutdown,
 }
 
 impl Cpu {
@@ -876,6 +910,31 @@ impl Cpu {
         Ok(())
     }
 
+    /// Sets the hart up the way machine-mode firmware hands control to a
+    /// kernel, and enters it in supervisor mode.
+    ///
+    /// The delegation mask is the interesting part: everything a supervisor
+    /// can handle is delegated to it, *except* cause 9, an ecall from
+    /// supervisor mode. That one has to stay with machine mode, because it is
+    /// how the kernel calls the firmware.
+    pub fn boot_supervisor(&mut self, entry: u64, hartid: u64, dtb: u64) {
+        const DELEGATED: u64 = 0xb1ff;
+        self.csrs.force(csr::MEDELEG, DELEGATED);
+        self.csrs
+            .force(csr::MIDELEG, int::SSIP | int::STIP | int::SEIP);
+        // The kernel reads `time` and `cycle` directly, so machine mode has
+        // to permit it; without this every rdtime is an illegal instruction.
+        self.csrs.force(csr::MCOUNTEREN, !0);
+        self.csrs.force(csr::SCOUNTEREN, !0);
+
+        self.sbi = true;
+        self.priv_mode = Priv::Supervisor;
+        self.pc = entry;
+        // The boot protocol: a0 is the hart id, a1 points at the device tree.
+        self.regs[10] = hartid;
+        self.regs[11] = dtb;
+    }
+
     /// Steps until the program stops, for at most `max_steps` instructions.
     ///
     /// Traps are not stopping conditions on their own: a riscv-tests binary
@@ -885,6 +944,9 @@ impl Cpu {
     pub fn run(&mut self, max_steps: u64) -> Exit {
         for _ in 0..max_steps {
             let r = self.step();
+            if self.shutdown {
+                return Exit::Shutdown;
+            }
             if let Some(v) = self.mem.tohost_value {
                 // Bit 0 set means "terminate"; the rest is the payload's status,
                 // where 0 is success and n identifies the failing test case.

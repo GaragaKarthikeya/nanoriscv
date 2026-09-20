@@ -11,6 +11,7 @@ pub mod elf;
 pub mod memory;
 pub mod mmu;
 pub mod plic;
+pub mod sbi;
 pub mod trap;
 pub mod uart;
 
