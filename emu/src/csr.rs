@@ -9,6 +9,12 @@
 use crate::cpu::Xlen;
 use crate::trap::Priv;
 
+// Unprivileged floating-point state. All three are windows onto one
+// register: `fflags` is its low five bits and `frm` its next three.
+pub const FFLAGS: u16 = 0x001;
+pub const FRM: u16 = 0x002;
+pub const FCSR: u16 = 0x003;
+
 // Unprivileged counters.
 pub const CYCLE: u16 = 0xC00;
 pub const TIME: u16 = 0xC01;
@@ -90,6 +96,16 @@ pub mod mstatus {
     pub const S_VISIBLE: u64 = SIE | SPIE | SPP | FS | XS | SUM | MXR | UXL | SD;
 }
 
+/// `fcsr` field positions.
+pub mod fcsr {
+    /// The accrued exception flags, in the low five bits.
+    pub const FLAGS: u64 = 0x1f;
+    pub const RM_SHIFT: u32 = 5;
+    pub const RM: u64 = 0x7 << RM_SHIFT;
+    /// Everything defined; the rest is reserved and reads as zero.
+    pub const WRITABLE: u64 = FLAGS | RM;
+}
+
 /// Interrupt bits, shared by `mie`, `mip`, `sie` and `sip`.
 pub mod int {
     pub const SSIP: u64 = 1 << 1;
@@ -150,6 +166,8 @@ impl CsrFile {
     fn misa(xlen: Xlen) -> u64 {
         let letters = (1 << 0)   // A
             | (1 << 2)           // C
+            | (1 << 3)           // D
+            | (1 << 5)           // F
             | (1 << 8)           // I
             | (1 << 12)          // M
             | (1 << 18)          // S
@@ -166,7 +184,10 @@ impl CsrFile {
     pub fn exists(&self, addr: u16) -> bool {
         matches!(
             addr,
-            CYCLE
+            FFLAGS
+                | FRM
+                | FCSR
+                | CYCLE
                 | TIME
                 | INSTRET
                 | SSTATUS
@@ -221,6 +242,8 @@ impl CsrFile {
     /// Reads the architectural value, resolving the supervisor aliases.
     pub fn read(&self, addr: u16) -> u64 {
         let v = match addr {
+            FFLAGS => self.regs[FCSR as usize] & fcsr::FLAGS,
+            FRM => (self.regs[FCSR as usize] & fcsr::RM) >> fcsr::RM_SHIFT,
             SSTATUS => self.status() & mstatus::S_VISIBLE,
             MSTATUS => self.status(),
             SIE => self.regs[MIE as usize] & int::S_VISIBLE,
@@ -257,6 +280,19 @@ impl CsrFile {
     /// the supervisor aliases onto their machine registers.
     pub fn write(&mut self, addr: u16, value: u64) {
         match addr {
+            FCSR => self.regs[FCSR as usize] = value & fcsr::WRITABLE,
+            FFLAGS => {
+                let old = self.regs[FCSR as usize];
+                self.regs[FCSR as usize] = (old & !fcsr::FLAGS) | (value & fcsr::FLAGS);
+            }
+            // frm is WLRL, but every three-bit value is a legal encoding to
+            // store; two of them are simply reserved and are rejected when an
+            // instruction tries to round with them, not when they are written.
+            FRM => {
+                let old = self.regs[FCSR as usize];
+                self.regs[FCSR as usize] =
+                    (old & !fcsr::RM) | ((value << fcsr::RM_SHIFT) & fcsr::RM);
+            }
             MSTATUS => {
                 let old = self.regs[MSTATUS as usize];
                 self.regs[MSTATUS as usize] =

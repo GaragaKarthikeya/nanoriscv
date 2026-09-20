@@ -14,6 +14,7 @@
 use crate::compress::decompress;
 use crate::csr::{self, int, mstatus, CsrFile};
 use crate::decode::*;
+use crate::fpu::{self, Rm};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::mmu;
 use crate::plic;
@@ -76,6 +77,10 @@ pub struct Cpu {
     /// back exactly as the 32-bit core's register file will. x0 is stored but
     /// always reads as zero.
     pub regs: [u64; 32],
+    /// The floating-point register file. Always 64 bits wide, at both XLENs:
+    /// `f` registers are sized by the widest supported format, not by the
+    /// integer width, so D on RV32 needs no special case.
+    pub fregs: [u64; 32],
     pub pc: u64,
     pub xlen: Xlen,
     pub csrs: CsrFile,
@@ -125,6 +130,7 @@ impl Cpu {
     pub fn new(mem_size: usize, xlen: Xlen) -> Self {
         let mut cpu = Cpu {
             regs: [0; 32],
+            fregs: [0; 32],
             pc: DRAM_BASE,
             xlen,
             csrs: CsrFile::new(xlen),
@@ -177,6 +183,74 @@ impl Cpu {
     #[inline]
     fn rs(&self, r: usize) -> i64 {
         sext(self.rr(r), self.xbits()) as i64
+    }
+
+    /// Whether the floating-point unit is on. `mstatus.FS` of zero means the
+    /// context does not own FP state, and every FP instruction -- including a
+    /// read of `fcsr` -- traps, which is how an operating system finds out it
+    /// needs to allocate that state for the process.
+    #[inline]
+    fn fp_enabled(&self) -> bool {
+        self.csrs.read(csr::MSTATUS) & mstatus::FS != 0
+    }
+
+    /// Marks the FP state dirty, so that a context switch knows it has to be
+    /// saved. Any write to an `f` register or to `fcsr` does this.
+    #[inline]
+    fn dirty_fp(&mut self) {
+        let status = self.csrs.read(csr::MSTATUS);
+        self.csrs
+            .force(csr::MSTATUS, (status & !mstatus::FS) | mstatus::FS);
+    }
+
+    /// Accumulates exception flags into `fflags`.
+    #[inline]
+    fn set_fflags(&mut self, flags: u32) {
+        if flags != 0 {
+            let old = self.csrs.read(csr::FCSR);
+            self.csrs.force(csr::FCSR, old | flags as u64);
+        }
+        self.dirty_fp();
+    }
+
+    #[inline]
+    fn fw(&mut self, r: usize, v: u64) {
+        self.fregs[r] = v;
+        self.dirty_fp();
+    }
+
+    /// Reads a single-precision operand out of a 64-bit register.
+    ///
+    /// A 32-bit value living in a 64-bit register must be NaN-boxed: the
+    /// upper half all ones. Anything else is not a single-precision number at
+    /// all -- most often it is a double that some code is misreading -- and
+    /// the spec requires it be treated as the canonical NaN rather than
+    /// quietly having its low half used.
+    #[inline]
+    fn unbox(v: u64) -> u64 {
+        if v >> 32 == 0xffff_ffff {
+            v & 0xffff_ffff
+        } else {
+            fpu::S.nan()
+        }
+    }
+
+    /// NaN-boxes a single-precision result on its way into a register.
+    #[inline]
+    fn box32(v: u64) -> u64 {
+        0xffff_ffff_0000_0000 | (v & 0xffff_ffff)
+    }
+
+    /// Resolves an instruction's rounding-mode field, following it to `frm`
+    /// when it asks for the dynamic mode. A reserved encoding in either place
+    /// makes the instruction illegal -- rounding has to mean something.
+    fn rounding(&self, f3: u32) -> Option<Rm> {
+        let bits = if f3 == 0x7 {
+            (self.csrs.read(csr::FCSR) & csr::fcsr::RM) >> csr::fcsr::RM_SHIFT
+        } else {
+            f3 as u64
+        };
+        Rm::from_bits(bits as u32)
     }
 
     /// Translates a virtual address for `access`, which is a no-op when the
@@ -577,6 +651,207 @@ impl Cpu {
         self.pc = self.csrs.read(epc);
     }
 
+    /// The format an instruction's two-bit fmt field selects. Only the two
+    /// this hart implements are legal; the quad and half encodings are not.
+    fn fp_fmt(&self, bits: u32) -> Option<fpu::Fmt> {
+        match bits {
+            0 => Some(fpu::S),
+            1 => Some(fpu::D),
+            _ => None,
+        }
+    }
+
+    /// Reads an operand in `fmt`, unboxing a single-precision one.
+    #[inline]
+    fn freg(&self, fmt: fpu::Fmt, r: usize) -> u64 {
+        if fmt == fpu::S {
+            Self::unbox(self.fregs[r])
+        } else {
+            self.fregs[r]
+        }
+    }
+
+    /// Writes a result in `fmt`, boxing a single-precision one.
+    #[inline]
+    fn write_freg(&mut self, fmt: fpu::Fmt, r: usize, v: u64) {
+        let v = if fmt == fpu::S { Self::box32(v) } else { v };
+        self.fw(r, v);
+    }
+
+    /// OP-FP: arithmetic, comparisons, conversions and the register moves.
+    ///
+    /// funct7 splits into a five-bit operation selector and a two-bit format,
+    /// so the same table of operations covers single and double precision.
+    fn execute_op_fp(
+        &mut self,
+        inst: u32,
+        rd: usize,
+        rs1: usize,
+        rs2: usize,
+        f3: u32,
+        f7: u32,
+    ) -> Result<(), Exception> {
+        let illegal = Err(Exception::IllegalInstruction(inst));
+        let xb = self.xbits();
+        let Some(fmt) = self.fp_fmt(f7 & 0x3) else {
+            return illegal;
+        };
+        // Every arithmetic operation needs a rounding mode; the ones that do
+        // not use funct3 for rounding check their own encoding instead.
+        let rm = self.rounding(f3);
+
+        match f7 >> 2 {
+            // FADD, FSUB, FMUL, FDIV
+            op @ 0x00..=0x03 => {
+                let Some(rm) = rm else { return illegal };
+                let (a, b) = (self.freg(fmt, rs1), self.freg(fmt, rs2));
+                let (v, flags) = match op {
+                    0x00 => fpu::add(fmt, a, b, rm),
+                    0x01 => fpu::sub(fmt, a, b, rm),
+                    0x02 => fpu::mul(fmt, a, b, rm),
+                    _ => fpu::div(fmt, a, b, rm),
+                };
+                self.write_freg(fmt, rd, v);
+                self.set_fflags(flags);
+            }
+            // FSQRT. It has one source, so rs2 is part of the encoding.
+            0x0b => {
+                let Some(rm) = rm else { return illegal };
+                if rs2 != 0 {
+                    return illegal;
+                }
+                let (v, flags) = fpu::sqrt(fmt, self.freg(fmt, rs1), rm);
+                self.write_freg(fmt, rd, v);
+                self.set_fflags(flags);
+            }
+            // FSGNJ, FSGNJN, FSGNJX. These are bit manipulation, not
+            // arithmetic: they raise no flags and pass NaNs through
+            // unchanged, which is what makes fabs and fneg out of them exact.
+            0x04 => {
+                let (a, b) = (self.freg(fmt, rs1), self.freg(fmt, rs2));
+                let sign = match f3 {
+                    0x0 => b & fmt.sign_mask(),
+                    0x1 => !b & fmt.sign_mask(),
+                    0x2 => (a ^ b) & fmt.sign_mask(),
+                    _ => return illegal,
+                };
+                let v = (a & !fmt.sign_mask()) | sign;
+                self.write_freg(fmt, rd, v);
+            }
+            // FMIN, FMAX
+            0x05 => {
+                let want_max = match f3 {
+                    0x0 => false,
+                    0x1 => true,
+                    _ => return illegal,
+                };
+                let (a, b) = (self.freg(fmt, rs1), self.freg(fmt, rs2));
+                let (v, flags) = fpu::min_max(fmt, a, b, want_max);
+                self.write_freg(fmt, rd, v);
+                self.set_fflags(flags);
+            }
+            // FCVT between the two precisions. fmt names the destination and
+            // rs2 the source, so the two must differ.
+            0x08 => {
+                let Some(rm) = rm else { return illegal };
+                let Some(from) = self.fp_fmt(rs2 as u32) else {
+                    return illegal;
+                };
+                if from == fmt {
+                    return illegal;
+                }
+                let (v, flags) = fpu::convert(from, fmt, self.freg(from, rs1), rm);
+                self.write_freg(fmt, rd, v);
+                self.set_fflags(flags);
+            }
+            // FEQ, FLT, FLE. The result is an integer register, and a
+            // comparison never writes FP state beyond the flags.
+            0x14 => {
+                let a = self.freg(fmt, rs1);
+                let b = self.freg(fmt, rs2);
+                let (v, flags) = match f3 {
+                    0x0 => fpu::lt(fmt, a, b, true),
+                    0x1 => fpu::lt(fmt, a, b, false),
+                    0x2 => fpu::eq(fmt, a, b),
+                    _ => return illegal,
+                };
+                self.wr(rd, u64::from(v));
+                self.set_fflags(flags);
+            }
+            // FCVT to an integer. rs2 selects the width and signedness; the
+            // 64-bit forms do not exist on RV32.
+            0x18 => {
+                let Some(rm) = rm else { return illegal };
+                let (width, signed) = match rs2 {
+                    0 => (32, true),
+                    1 => (32, false),
+                    2 if xb == 64 => (64, true),
+                    3 if xb == 64 => (64, false),
+                    _ => return illegal,
+                };
+                let (v, flags) = fpu::to_int(fmt, self.freg(fmt, rs1), width, signed, rm);
+                // A 32-bit result is sign-extended into the register even
+                // when it is unsigned, so that it compares equal to the
+                // sign-extended form every other 32-bit operation produces.
+                self.wr(rd, sext(v, width));
+                self.set_fflags(flags);
+            }
+            // FCVT from an integer.
+            0x1a => {
+                let Some(rm) = rm else { return illegal };
+                let src = self.rr(rs1);
+                let (sign, magnitude) = match rs2 {
+                    0 => {
+                        let v = sext(src, 32) as i64;
+                        (v < 0, v.unsigned_abs())
+                    }
+                    1 => (false, src & 0xffff_ffff),
+                    2 if xb == 64 => {
+                        let v = src as i64;
+                        (v < 0, v.unsigned_abs())
+                    }
+                    3 if xb == 64 => (false, src),
+                    _ => return illegal,
+                };
+                let (v, flags) = fpu::from_int(fmt, sign, magnitude, rm);
+                self.write_freg(fmt, rd, v);
+                self.set_fflags(flags);
+            }
+            // FMV.X.W / FMV.X.D, and FCLASS.
+            0x1c => {
+                if rs2 != 0 {
+                    return illegal;
+                }
+                match (f3, fmt) {
+                    // The move is a raw copy, so it reads the register
+                    // without unboxing: it is how software inspects a
+                    // badly-boxed value in the first place.
+                    (0x0, fpu::S) => self.wr(rd, sext(self.fregs[rs1], 32)),
+                    (0x0, _) if xb == 64 => self.wr(rd, self.fregs[rs1]),
+                    (0x1, _) => {
+                        let v = fpu::classify(fmt, self.freg(fmt, rs1));
+                        self.wr(rd, v);
+                    }
+                    _ => return illegal,
+                }
+            }
+            // FMV.W.X / FMV.D.X: the reverse, equally raw.
+            0x1e => {
+                if rs2 != 0 || f3 != 0 {
+                    return illegal;
+                }
+                let v = self.rr(rs1);
+                match fmt {
+                    fpu::S => self.fw(rd, Self::box32(v)),
+                    _ if xb == 64 => self.fw(rd, v),
+                    _ => return illegal,
+                }
+            }
+            _ => return illegal,
+        }
+        Ok(())
+    }
+
     fn execute(&mut self, inst: u32, inst_pc: u64, next_pc: u64) -> Result<(), Exception> {
         let (rd, rs1, rs2) = (rd(inst), rs1(inst), rs2(inst));
         let (f3, f7) = (funct3(inst), funct7(inst));
@@ -757,6 +1032,62 @@ impl Cpu {
                     }
                 }
             }
+            // LOAD-FP and STORE-FP. The width comes from funct3, and unlike
+            // the integer loads there is no sign extension to choose: a
+            // narrower value is NaN-boxed instead.
+            0x07 | 0x27 => {
+                if !self.fp_enabled() {
+                    return illegal;
+                }
+                let store = opcode(inst) == 0x27;
+                let offset = if store { imm_s(inst) } else { imm_i(inst) };
+                let addr = trunc(self.rr(rs1).wrapping_add(offset as i64 as u64), xb);
+                match (f3, store) {
+                    (0x2, false) => {
+                        let v = self.read_mem(addr, 4)?;
+                        self.fw(rd, Self::box32(v));
+                    }
+                    (0x3, false) => {
+                        let v = self.read_mem(addr, 8)?;
+                        self.fw(rd, v);
+                    }
+                    (0x2, true) => self.write_mem(addr, 4, self.fregs[rs2])?,
+                    (0x3, true) => self.write_mem(addr, 8, self.fregs[rs2])?,
+                    _ => return illegal,
+                }
+            }
+            // The fused multiply-add family. funct7's low two bits pick the
+            // format and its top five name the third source register.
+            0x43 | 0x47 | 0x4b | 0x4f => {
+                let (fmt, rm) = match (self.fp_fmt(f7 & 0x3), self.rounding(f3)) {
+                    (Some(fmt), Some(rm)) if self.fp_enabled() => (fmt, rm),
+                    _ => return illegal,
+                };
+                let rs3 = (f7 >> 2) as usize;
+                let (a, b, c) = (
+                    self.freg(fmt, rs1),
+                    self.freg(fmt, rs2),
+                    self.freg(fmt, rs3),
+                );
+                // FMADD adds, FMSUB subtracts, and the two negated forms
+                // negate the product as well.
+                let (neg_product, neg_addend) = match opcode(inst) {
+                    0x43 => (false, false), // FMADD
+                    0x47 => (false, true),  // FMSUB
+                    0x4b => (true, false),  // FNMSUB: -(a*b) + c
+                    _ => (true, true),      // FNMADD: -(a*b) - c
+                };
+                let (v, flags) = fpu::fma(fmt, a, b, c, neg_product, neg_addend, rm);
+                self.write_freg(fmt, rd, v);
+                self.set_fflags(flags);
+            }
+            // OP-FP: everything else the F and D extensions define.
+            0x53 => {
+                if !self.fp_enabled() {
+                    return illegal;
+                }
+                return self.execute_op_fp(inst, rd, rs1, rs2, f3, f7);
+            }
             // MISC-MEM: FENCE and FENCE.I are no-ops on a single in-order hart.
             0x0f => {}
             // SYSTEM
@@ -820,6 +1151,11 @@ impl Cpu {
                     {
                         return illegal;
                     }
+                    // The FP CSRs are part of the FP context, so they are
+                    // unreachable while mstatus.FS says the context has none.
+                    if matches!(addr, csr::FFLAGS | csr::FRM | csr::FCSR) && !self.fp_enabled() {
+                        return illegal;
+                    }
                     // TVM traps a supervisor's view of the address space, and
                     // that means satp as well as SFENCE.VMA -- reading the
                     // page table root is as good as walking it.
@@ -845,6 +1181,11 @@ impl Cpu {
                         self.csrs.write(addr, trunc(new, xb));
                         if matches!(addr, csr::MINSTRET | csr::MINSTRETH | csr::INSTRET) {
                             self.wrote_instret = true;
+                        }
+                        // Changing the rounding mode or the accrued flags is
+                        // a change to the FP context like any other.
+                        if matches!(addr, csr::FFLAGS | csr::FRM | csr::FCSR) {
+                            self.dirty_fp();
                         }
                     }
                     self.wr(rd, old);

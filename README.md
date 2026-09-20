@@ -4,8 +4,8 @@ A RISC-V processor built from scratch, twice: once as a Rust instruction-set
 simulator, then as a SystemVerilog core verified against it.
 
 The simulator is RV32 **and** RV64 in one implementation. That is not
-indecision: the RTL core will be RV32 while the software side is heading for
-RV64 and a Linux boot, and a single model keeps those two from drifting apart.
+indecision: the RTL core will be RV32 while the software side needed RV64 to
+boot Linux, and a single model keeps those two from drifting apart.
 
 The simulator comes first and is not a throwaway. It is the *golden model* — the
 definition of correct behaviour that the hardware is checked against. A core
@@ -15,16 +15,18 @@ disagree.
 
 ## Status
 
-**RV32IMAC and RV64IMAC, machine/supervisor/user modes, and virtual memory.
-192/192 on the official riscv-tests suite.**
+**RV32GC and RV64GC, machine/supervisor/user modes, and virtual memory. It
+boots Linux to userspace. 236/236 on the official riscv-tests suite.**
 
 | Suite | Tests |
 | --- | --- |
 | `rv32` user: ui / um / ua / uc | 42 + 8 + 10 + 1 |
+| `rv32` user: uf / ud | 11 + 10 |
 | `rv64` user: ui / um / ua / uc | 54 + 13 + 19 + 1 |
+| `rv64` user: uf / ud | 11 + 12 |
 | `rv32si` / `rv32mi` privileged | 6 + 15 |
 | `rv64si` / `rv64mi` privileged | 7 + 16 |
-| hand-written | 97 |
+| hand-written | 148 |
 
 Seven upstream tests are skipped by name in `tests/riscv_tests.rs`, each for a
 feature that belongs to a *different* specification: the `amocas` tests need
@@ -34,12 +36,16 @@ registers.
 The devices are in too — CLINT, PLIC and a 16550 UART, at the addresses
 QEMU's `virt` machine uses, so a stock device tree describes them correctly.
 
+Floating point is a soft-float implementation in `emu/src/fpu.rs`: exact
+integer arithmetic rounded exactly once, rather than the host's `f32` and
+`f64`. The host would be wrong in three ways — it rounds to nearest-even
+only, so four of the five modes would be unimplementable; it does not report
+the flags `fcsr` accumulates; and it may produce any NaN it likes, where
+RISC-V pins down one canonical value.
+
 ```
 make demo    # a bare-metal program printing through the UART
 ```
-
-Still missing before a Linux boot: F and D (floating point), and a device
-tree to hand the kernel.
 
 ```
 make docs        # fetch specs, encodings and riscv-tests (once, after cloning)
@@ -57,10 +63,19 @@ upstream expects, and falls back to `clang-18` plus an LLD (the system one, or
 the `rust-lld` inside the Rust toolchain) on a machine without a RISC-V GNU
 toolchain. The test sources are untouched either way; only the driver differs.
 
-Note `-march=rv32im_zicsr_zifencei`. Since GCC 12 those two are separate
-extensions, and GCC 14 rejects a `csrr` whose extension is not named. Clang is
-lenient about it, which is exactly the kind of difference that makes a build
-work on one machine and not the next.
+Note `-march=rv32imafd_zicsr_zifencei`. Since GCC 12 `zicsr` and `zifencei`
+are separate extensions, and GCC 14 rejects a `csrr` whose extension is not
+named. Clang is lenient about it, which is exactly the kind of difference that
+makes a build work on one machine and not the next.
+
+`f` and `d` are named for *every* suite, not only the FP ones: the `csr` test
+asks `misa` whether the hart has F, and then checks that an FP store traps
+while `mstatus.FS` is off — a check it can only assemble if the toolchain was
+told F exists. Left out, that test deliberately fails on a hart with F.
+
+One upstream file is excluded rather than skipped: `rv32ud/move.S` includes
+the RV64 version, which moves a double through an integer register, and no
+RV32 assembler can encode that. Upstream excludes it from the RV32 build too.
 
 ## Layout
 
@@ -74,6 +89,7 @@ emu/         the Rust simulator (crate: nanoemu)
   src/plic.rs     platform-level interrupt controller
   src/uart.rs     NS16550a console
   src/compress.rs the C extension, expanded to base instructions at fetch
+  src/fpu.rs      soft-float for F and D: exact integers, rounded once
   src/elf.rs      ELF32/ELF64 loader and symbol lookup
   src/trap.rs     privilege modes, exception and interrupt causes
   tests/rv32im.rs      hand-written RV32 tests, one per spec corner
@@ -81,9 +97,11 @@ emu/         the Rust simulator (crate: nanoemu)
   tests/ac.rs          the A and C extensions
   tests/privileged.rs  privilege modes, delegation and virtual memory
   tests/devices.rs     the PLIC and UART, including a full interrupt path
+  tests/sbi.rs         the firmware layer: console, timers, IPIs, reset
+  tests/fp.rs          F and D, plus a diff against the host's own IEEE f64
 examples/    hello.S and a linker script, for `make demo`
   examples/diag.rs     prints the first unexpected trap in a test binary
-  tests/riscv_tests.rs the official rv32/rv64 ui and um suites
+  tests/riscv_tests.rs the official rv32/rv64 suites, all sixteen of them
 rtl/         the SystemVerilog core (not started — see rtl/README.md)
 docs/        specs, encodings, riscv-tests (gitignored; see docs/README.md)
 build/       compiled test binaries (gitignored)
@@ -174,15 +192,19 @@ linker script use, so upstream test binaries will load without relinking.
 1. ~~**RV32IM emulator**~~ — base integer set, M extension, Zicsr, traps. **Done.**
 2. ~~**riscv-tests**~~ — the official `rv32ui` and `rv32um` suites, via an ELF32
    loader and the `tohost` handshake. **Done: 50/50.**
-3. **Complete the emulator** — in progress.
+3. ~~**Complete the emulator**~~ — **Done: RV64GC, booting Linux.**
    - ~~RV64IM: widen to 64-bit~~ **Done.**
    - ~~A and C extensions~~ **Done.**
    - ~~Privilege modes, delegation, Sv32/Sv39 paging, CLINT~~ **Done,
      `si` and `mi` suites pass.**
    - ~~CLINT, PLIC and a 16550 UART~~ **Done.**
-   - F and D, for a full RV64GC.
-   - A device tree, then a Linux boot, with QEMU as a second reference when
-     the two disagree.
+   - ~~F and D, for a full RV64GC~~ **Done: 43/43 on `uf` and `ud`.**
+   - ~~A device tree, then a Linux boot~~ **Done: the kernel reaches
+     userspace and powers off through SBI.**
+   - QEMU as a second reference, to diff against when something disagrees.
+     Not built yet; the one reference we do have for the arithmetic is the
+     host's own IEEE `f64`, which `tests/fp.rs` diffs against for the
+     round-to-nearest mode.
 4. **RTL core** — a 5-stage RV32I pipeline in SystemVerilog, verified by
    lockstep diff against milestone 1.
 5. **FPGA** — put it on the ZCU104 using the parent repo's board support.
@@ -241,6 +263,33 @@ These all have tests, because each one was worth a test:
 - On RV64, `LUI` sign-extends. Every address at or above `0x8000_0000` has bit
   31 set, so `lui` cannot be used to build a DRAM address — it lands at the top
   of the address space instead.
+- A single-precision value in a 64-bit `f` register must be **NaN-boxed**: the
+  upper half all ones. A register that is not boxed is not a single-precision
+  number, and reads as the canonical NaN — using its low half instead is the
+  plausible wrong answer, and it is wrong silently.
+- `FMV.X.W` does *not* unbox. It is a raw copy of the low half, because it is
+  how software inspects a badly-boxed register in the first place.
+- Tininess is judged **after** rounding. A subnormal that rounds up onto the
+  smallest normal did not underflow, so detecting it first over-reports.
+- An out-of-range float-to-integer conversion raises invalid and *only*
+  invalid. Reporting inexact as well looks right until software tests for
+  exactness.
+- A NaN converts to the maximum **positive** integer, in the unsigned and the
+  signed case alike. Not zero, and not the minimum.
+- `fmin(-0.0, +0.0)` is `-0.0`, but the two compare equal, so nothing in the
+  ordering decides it — only the signs do.
+- `FNMSUB` is `-(a*b) + c`, not `-(a*b + c)`: the addend keeps its sign.
+- In a fused multiply-add the common exponent has to be budgeted from each
+  operand's *leading* bit, not from its exponent field. A double-precision
+  product is 106 bits wide, so it sits far below its own magnitude; budgeting
+  from the field truncates exactly the low bits that a cancellation against
+  the addend then exposes.
+- A reserved rounding mode is illegal when it is named in the instruction
+  *and* when the instruction asks for the dynamic mode and finds one in `frm`.
+  Checking only the instruction misses half of it.
+- With `mstatus.FS` at zero the context owns no FP state, so `fcsr` is
+  unreadable and every FP instruction traps. That trap is how an operating
+  system learns it has to allocate that state.
 
 ## How results get out of a test
 

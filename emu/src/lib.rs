@@ -8,6 +8,7 @@ pub mod cpu;
 pub mod csr;
 pub mod decode;
 pub mod elf;
+pub mod fpu;
 pub mod memory;
 pub mod mmu;
 pub mod plic;

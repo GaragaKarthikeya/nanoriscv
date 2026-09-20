@@ -161,6 +161,26 @@ fn rv64uc_compressed_suite() {
 }
 
 #[test]
+fn rv32uf_single_float_suite() {
+    run_suite("rv32uf-p-");
+}
+
+#[test]
+fn rv64uf_single_float_suite() {
+    run_suite("rv64uf-p-");
+}
+
+#[test]
+fn rv32ud_double_float_suite() {
+    run_suite("rv32ud-p-");
+}
+
+#[test]
+fn rv64ud_double_float_suite() {
+    run_suite("rv64ud-p-");
+}
+
+#[test]
 fn rv32si_supervisor_suite() {
     run_suite("rv32si-p-");
 }

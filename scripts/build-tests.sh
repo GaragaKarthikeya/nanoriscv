@@ -19,12 +19,16 @@ fi
 # zicsr and zifencei have been separate extensions since GCC 12, and GCC 14
 # rejects a csrr whose extension is not named in -march. Clang is lenient about
 # it; spelling them out keeps one flag string working for both.
-ISA32=rv32ima_zicsr_zifencei
-ISA64=rv64ima_zicsr_zifencei
+# F and D are named in every string, not just for the FP suites: the csr test
+# asks misa whether the hart has F and then checks that an FP store traps
+# while mstatus.FS is off, and it can only assemble that store if the
+# toolchain was told F exists.
+ISA32=rv32imafd_zicsr_zifencei
+ISA64=rv64imafd_zicsr_zifencei
 # The C suites need compressed encodings emitted; the others are built
 # without C so that they keep testing the 32-bit encodings.
-ISA32C=rv32imac_zicsr_zifencei
-ISA64C=rv64imac_zicsr_zifencei
+ISA32C=rv32imafdc_zicsr_zifencei
+ISA64C=rv64imafdc_zicsr_zifencei
 
 GNU=riscv64-unknown-elf-gcc
 if command -v "$GNU" >/dev/null 2>&1; then
@@ -59,11 +63,18 @@ mkdir -p "$OUT"
 
 built=0
 failed=0
+# rv32ud/move.S includes the rv64ud one, which moves a double through an
+# integer register -- something only RV64 can do, since fmv.x.d needs a
+# 64-bit destination. Upstream leaves the file in place and excludes it from
+# the RV32 build; so do we.
+NOT_BUILDABLE=" rv32ud-p-move "
+
 build_suite() { # <suite dir name> <march> <mabi>
   local suite=$1 march=$2 mabi=$3
   [ -d "$TESTS/isa/$suite" ] || return 0
   for src in "$TESTS/isa/$suite"/*.S; do
     local name="$suite-p-$(basename "$src" .S)"
+    case "$NOT_BUILDABLE" in *" $name "*) continue ;; esac
     if compile "$march" "$mabi" "$src" "$OUT/$name.elf" "$OUT/$name.log"; then
       rm -f "$OUT/$name.log"
       built=$((built + 1))
@@ -78,12 +89,16 @@ build_suite rv32ui "$ISA32" ilp32
 build_suite rv32um "$ISA32" ilp32
 build_suite rv32ua "$ISA32" ilp32
 build_suite rv32uc "$ISA32C" ilp32
+build_suite rv32uf "$ISA32" ilp32
+build_suite rv32ud "$ISA32" ilp32
 build_suite rv32si "$ISA32" ilp32
 build_suite rv32mi "$ISA32" ilp32
 build_suite rv64ui "$ISA64" lp64
 build_suite rv64um "$ISA64" lp64
 build_suite rv64ua "$ISA64" lp64
 build_suite rv64uc "$ISA64C" lp64
+build_suite rv64uf "$ISA64" lp64
+build_suite rv64ud "$ISA64" lp64
 build_suite rv64si "$ISA64" lp64
 build_suite rv64mi "$ISA64" lp64
 

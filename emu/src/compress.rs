@@ -74,13 +74,15 @@ const OP32: u32 = 0x3b;
 const LOAD: u32 = 0x03;
 const STORE: u32 = 0x23;
 const JALR: u32 = 0x67;
+const LOAD_FP: u32 = 0x07;
+const STORE_FP: u32 = 0x27;
 
 /// Expands one 16-bit instruction, or returns `None` if the encoding is
 /// illegal or reserved at this XLEN.
 ///
-/// Floating-point forms return `None` because F and D are not implemented; a
-/// program using them gets an illegal-instruction trap rather than silently
-/// wrong arithmetic.
+/// The floating-point forms expand to LOAD-FP and STORE-FP, whose register
+/// fields sit in the same places as the integer ones; whether the hart may
+/// execute them is `mstatus.FS`'s business, not the decoder's.
 pub fn decompress(i: u32, xlen: Xlen) -> Option<u32> {
     let rv64 = xlen == Xlen::Rv64;
     let rd = bits(i, 11, 7);
@@ -112,6 +114,26 @@ pub fn decompress(i: u32, xlen: Xlen) -> Option<u32> {
                 let imm = (bits(i, 6, 5) << 6) | (bits(i, 12, 10) << 3);
                 Some(i_type(LOAD, 0x3, rp(i, 2), rp(i, 7), imm as i32))
             }
+            0b001 => {
+                // C.FLD. The offset is scaled by eight, exactly as C.LD's is.
+                let imm = (bits(i, 6, 5) << 6) | (bits(i, 12, 10) << 3);
+                Some(i_type(LOAD_FP, 0x3, rp(i, 2), rp(i, 7), imm as i32))
+            }
+            0b011 if !rv64 => {
+                // C.FLW, which the encoding space gives up on RV64 to C.LD.
+                let imm = (bits(i, 5, 5) << 6) | (bits(i, 12, 10) << 3) | (bits(i, 6, 6) << 2);
+                Some(i_type(LOAD_FP, 0x2, rp(i, 2), rp(i, 7), imm as i32))
+            }
+            0b101 => {
+                // C.FSD
+                let imm = (bits(i, 6, 5) << 6) | (bits(i, 12, 10) << 3);
+                Some(s_type(STORE_FP, 0x3, rp(i, 7), rp(i, 2), imm as i32))
+            }
+            0b111 if !rv64 => {
+                // C.FSW
+                let imm = (bits(i, 5, 5) << 6) | (bits(i, 12, 10) << 3) | (bits(i, 6, 6) << 2);
+                Some(s_type(STORE_FP, 0x2, rp(i, 7), rp(i, 2), imm as i32))
+            }
             0b110 => {
                 // C.SW
                 let imm = (bits(i, 5, 5) << 6) | (bits(i, 12, 10) << 3) | (bits(i, 6, 6) << 2);
@@ -122,7 +144,7 @@ pub fn decompress(i: u32, xlen: Xlen) -> Option<u32> {
                 let imm = (bits(i, 6, 5) << 6) | (bits(i, 12, 10) << 3);
                 Some(s_type(STORE, 0x3, rp(i, 7), rp(i, 2), imm as i32))
             }
-            _ => None, // C.FLD / C.FSD / C.FLW / C.FSW
+            _ => None,
         },
 
         // Quadrant 1: immediate arithmetic and control flow.
@@ -258,6 +280,27 @@ pub fn decompress(i: u32, xlen: Xlen) -> Option<u32> {
                 (_, _, 0) => Some(i_type(JALR, 0x0, 1, rd, 0)),        // C.JALR
                 (_, _, _) => Some(r_type(OP, 0x0, 0x00, rd, rd, rs2)), // C.ADD
             },
+            0b001 => {
+                // C.FLDSP. f0 is a perfectly good destination, so unlike the
+                // integer stack loads there is no reserved rd.
+                let imm = (bits(i, 4, 2) << 6) | (bits(i, 12, 12) << 5) | (bits(i, 6, 5) << 3);
+                Some(i_type(LOAD_FP, 0x3, rd, 2, imm as i32))
+            }
+            0b011 if !rv64 => {
+                // C.FLWSP
+                let imm = (bits(i, 3, 2) << 6) | (bits(i, 12, 12) << 5) | (bits(i, 6, 4) << 2);
+                Some(i_type(LOAD_FP, 0x2, rd, 2, imm as i32))
+            }
+            0b101 => {
+                // C.FSDSP
+                let imm = (bits(i, 9, 7) << 6) | (bits(i, 12, 10) << 3);
+                Some(s_type(STORE_FP, 0x3, 2, rs2, imm as i32))
+            }
+            0b111 if !rv64 => {
+                // C.FSWSP
+                let imm = (bits(i, 8, 7) << 6) | (bits(i, 12, 9) << 2);
+                Some(s_type(STORE_FP, 0x2, 2, rs2, imm as i32))
+            }
             0b110 => {
                 // C.SWSP
                 let imm = (bits(i, 8, 7) << 6) | (bits(i, 12, 9) << 2);
@@ -268,7 +311,7 @@ pub fn decompress(i: u32, xlen: Xlen) -> Option<u32> {
                 let imm = (bits(i, 9, 7) << 6) | (bits(i, 12, 10) << 3);
                 Some(s_type(STORE, 0x3, 2, rs2, imm as i32))
             }
-            _ => None, // C.FLDSP / C.FSDSP / C.FLWSP / C.FSWSP
+            _ => None,
         },
 
         // 0b11 is not compressed; the caller never gets here.
