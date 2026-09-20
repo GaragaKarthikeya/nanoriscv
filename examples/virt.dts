@@ -19,7 +19,7 @@
 		 * earlycon=sbi prints through the firmware before any driver is
 		 * probed, which is the only console that shows an early failure.
 		 */
-		bootargs = "earlycon=sbi keep_bootcon console=ttyS0";
+		bootargs = "console=ttyS0 earlycon=sbi";
 		stdout-path = "/soc/serial@10000000";
 	};
 

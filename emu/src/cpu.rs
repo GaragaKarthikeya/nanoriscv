@@ -214,7 +214,7 @@ impl Cpu {
 
     /// Drops every cached translation. Called for SFENCE.VMA, which is the
     /// guest's promise that it has finished editing the page tables.
-    fn flush_tlb(&mut self) {
+    pub(crate) fn flush_tlb(&mut self) {
         for slot in &mut self.tlb {
             for e in slot {
                 e.valid = false;

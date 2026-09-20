@@ -45,6 +45,7 @@ const EXT_BASE: u64 = 0x10;
 const EXT_TIME: u64 = 0x5449_4D45;
 const EXT_SRST: u64 = 0x5352_5354;
 const EXT_DBCN: u64 = 0x4442_434E;
+const EXT_IPI: u64 = 0x0073_5049;
 
 #[test]
 fn boot_enters_supervisor_mode_with_the_boot_protocol_registers() {
@@ -243,4 +244,41 @@ fn a_user_syscall_does_not_end_the_run() {
         "the kernel handled it"
     );
     assert_eq!(cpu.csrs.read(csr::SCAUSE), 8, "ecall from user mode");
+}
+
+/// Sending an IPI has to actually raise one, even with a single hart.
+///
+/// The hart a kernel interrupts here is itself: RISC-V delivers irq_work by
+/// self-IPI, and irq_work runs the deferred callbacks that end an RCU grace
+/// period. A firmware that answers "success" without raising SSIP leaves
+/// irq_work_needs_cpu() true for good, and anything waiting on a grace
+/// period -- unregistering a console, for one -- waits forever.
+#[test]
+fn a_self_ipi_raises_a_supervisor_software_interrupt() {
+    let mut cpu = run_sbi(EXT_IPI, 0, 1, 0); // hart 0 in the mask, base 0
+    assert_eq!(cpu.regs[10], 0, "no error");
+    assert_ne!(cpu.csrs.read(csr::MIP) & int::SSIP, 0, "SSIP raised");
+
+    // A mask that names no hart raises nothing.
+    let cpu2 = run_sbi(EXT_IPI, 0, 0, 0);
+    assert_eq!(cpu2.csrs.read(csr::MIP) & int::SSIP, 0);
+
+    // And the kernel is actually interrupted by it.
+    cpu.csrs.write(csr::STVEC, DRAM_BASE + 0x400);
+    cpu.csrs.write(csr::MSTATUS, mstatus::SIE);
+    cpu.csrs.write(csr::SIE, int::SSIP);
+    cpu.run(1);
+    assert_eq!(cpu.pc, DRAM_BASE + 0x400, "entered the handler");
+    assert_eq!(
+        cpu.csrs.read(csr::SCAUSE),
+        (1 << 63) | 1,
+        "supervisor software"
+    );
+}
+
+/// A base of all-ones means every hart, whatever the mask says.
+#[test]
+fn an_ipi_to_every_hart_ignores_the_mask() {
+    let cpu = run_sbi(EXT_IPI, 0, 0, u64::MAX);
+    assert_ne!(cpu.csrs.read(csr::MIP) & int::SSIP, 0);
 }

@@ -85,13 +85,33 @@ impl Cpu {
                     };
                 }
                 LEGACY_SHUTDOWN => return false,
-                // IPIs and remote fences are nothing to do on one hart with
-                // no caches to keep coherent.
-                LEGACY_CLEAR_IPI
-                | LEGACY_SEND_IPI
-                | LEGACY_REMOTE_FENCE_I
+                // The legacy IPI call takes a *pointer* to the hart mask
+                // rather than the mask itself. A null pointer means every
+                // hart, which on this machine is the caller.
+                LEGACY_SEND_IPI => {
+                    let selected = args[0] == 0
+                        || self
+                            .mem
+                            .read(args[0], 8)
+                            .map(|mask| mask & 1 != 0)
+                            .unwrap_or(false);
+                    if selected {
+                        self.csrs.set_bits(csr::MIP, int::SSIP);
+                    }
+                    self.regs[10] = 0;
+                }
+                LEGACY_CLEAR_IPI => {
+                    self.csrs.clear_bits(csr::MIP, int::SSIP);
+                    self.regs[10] = 0;
+                }
+                // Remote fences reach only this hart, and its translation
+                // cache is dropped so a page table edit elsewhere is seen.
+                LEGACY_REMOTE_FENCE_I
                 | LEGACY_REMOTE_SFENCE_VMA
-                | LEGACY_REMOTE_SFENCE_VMA_ASID => self.regs[10] = 0,
+                | LEGACY_REMOTE_SFENCE_VMA_ASID => {
+                    self.flush_tlb();
+                    self.regs[10] = 0;
+                }
                 _ => self.regs[10] = (-2i64) as u64,
             }
             return true;
@@ -130,8 +150,27 @@ impl Cpu {
 
             // One hart: an IPI to oneself is already delivered, and there are
             // no remote caches or TLBs to shoot down.
-            (EXT_IPI, 0) => SbiRet::success(),
-            (EXT_RFENCE, _) => SbiRet::success(),
+            // Sending an IPI is not a no-op even on a single hart, because
+            // the hart the kernel is interrupting is itself. RISC-V delivers
+            // irq_work by self-IPI, and irq_work is how deferred work --
+            // including the callback that ends an SRCU grace period -- gets
+            // run. Answering "success" without raising SSIP leaves
+            // irq_work_needs_cpu() true forever: the idle loop can never
+            // conclude it has nothing outstanding, and anything waiting on a
+            // grace period waits for good.
+            (EXT_IPI, 0) => {
+                if hart_selected(args[0], args[1], 0) {
+                    self.csrs.set_bits(csr::MIP, int::SSIP);
+                }
+                SbiRet::success()
+            }
+            // One hart, so a remote fence is a local one. The translation
+            // cache still has to be dropped: the point of the call is that
+            // page tables changed.
+            (EXT_RFENCE, _) => {
+                self.flush_tlb();
+                SbiRet::success()
+            }
 
             // Hart state management. Hart 0 is the only hart and it is
             // already started, so there is nothing to start and nothing to
@@ -181,5 +220,19 @@ impl Cpu {
         self.mem.clint.mtimecmp = when;
         self.timer_armed = true;
         self.csrs.clear_bits(csr::MIP, int::STIP);
+    }
+}
+
+/// Whether `hart` is named by an SBI hart mask.
+///
+/// A base of all-ones is the spec's "every hart", in which case the mask is
+/// ignored; otherwise bit `hart - base` selects it.
+fn hart_selected(mask: u64, base: u64, hart: u64) -> bool {
+    if base == u64::MAX {
+        return true;
+    }
+    match hart.checked_sub(base) {
+        Some(bit) if bit < 64 => mask & (1 << bit) != 0,
+        _ => false,
     }
 }
