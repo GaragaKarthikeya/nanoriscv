@@ -61,11 +61,17 @@ fn addw_discards_carry_out_of_bit_31() {
 }
 
 #[test]
-fn shift_amounts_are_six_bits_on_rv64_and_five_on_rv32() {
-    // The same encoding shifts by 33 on RV64 and by 1 on RV32.
+fn shift_amounts_are_six_bits_on_rv64_and_illegal_past_five_on_rv32() {
+    // An immediate shift by 33 is a 6-bit shift amount on RV64. On RV32 that
+    // bit belongs to funct7, so the same encoding is not a shift by 1 -- it
+    // is not a legal instruction at all.
     let prog = [addi(5, 0, 1), i(0x13, 0x1, 10, 5, 33), ECALL];
     assert_eq!(run_xlen(Xlen::Rv64, &prog).regs[10], 1u64 << 33);
-    assert_eq!(run_xlen(Xlen::Rv32, &prog).regs[10], 2);
+
+    let mut cpu = Cpu::rv32(MEM);
+    cpu.mem.load(&image(&prog));
+    cpu.step().expect("the addi is fine");
+    assert!(matches!(cpu.step(), Err(Exception::IllegalInstruction(_))));
 }
 
 #[test]

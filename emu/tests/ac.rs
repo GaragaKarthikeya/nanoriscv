@@ -168,9 +168,11 @@ fn an_odd_pc_faults() {
     let mut cpu = Cpu::rv64(MEM);
     cpu.mem.load(&stream(&[C(0x0001)]));
     cpu.pc = DRAM + 1;
+    // Cause 0, not an access fault: the address is badly formed rather than
+    // unreachable.
     assert!(matches!(
         cpu.step(),
-        Err(Exception::InstructionAccessFault(_))
+        Err(Exception::InstructionAddressMisaligned(_))
     ));
 }
 

@@ -20,15 +20,21 @@ use nanoemu::elf::Elf;
 /// Tests that exercise an extension this emulator does not implement.
 ///
 /// Upstream files the `amocas` tests under `ua`, but compare-and-swap is
-/// Zacas, a separate extension from A (which is Zalrsc plus Zaamo). They are
-/// named here rather than filtered by a pattern so that adding Zacas later
-/// means deleting three lines and watching them go green.
+/// Zacas, a separate extension from A (which is Zalrsc plus Zaamo). The
+/// `breakpoint` tests need Sdtrig, the debug specification's trigger
+/// registers, which is a different specification again. They are named here
+/// rather than filtered by a pattern so that implementing either one means
+/// deleting lines and watching them go green.
 const UNIMPLEMENTED: &[&str] = &[
+    // Zacas
     "rv32ua-p-amocas_w",
     "rv32ua-p-amocas_d",
     "rv64ua-p-amocas_w",
     "rv64ua-p-amocas_d",
     "rv64ua-p-amocas_q",
+    // Sdtrig
+    "rv32mi-p-breakpoint",
+    "rv64mi-p-breakpoint",
 ];
 
 /// 64 MiB, matching the CLI, so a test that runs here runs there.
@@ -152,4 +158,24 @@ fn rv32uc_compressed_suite() {
 #[test]
 fn rv64uc_compressed_suite() {
     run_suite("rv64uc-p-");
+}
+
+#[test]
+fn rv32si_supervisor_suite() {
+    run_suite("rv32si-p-");
+}
+
+#[test]
+fn rv64si_supervisor_suite() {
+    run_suite("rv64si-p-");
+}
+
+#[test]
+fn rv32mi_machine_suite() {
+    run_suite("rv32mi-p-");
+}
+
+#[test]
+fn rv64mi_machine_suite() {
+    run_suite("rv64mi-p-");
 }

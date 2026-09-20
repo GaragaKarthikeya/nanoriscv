@@ -78,10 +78,14 @@ build_suite rv32ui "$ISA32" ilp32
 build_suite rv32um "$ISA32" ilp32
 build_suite rv32ua "$ISA32" ilp32
 build_suite rv32uc "$ISA32C" ilp32
+build_suite rv32si "$ISA32" ilp32
+build_suite rv32mi "$ISA32" ilp32
 build_suite rv64ui "$ISA64" lp64
 build_suite rv64um "$ISA64" lp64
 build_suite rv64ua "$ISA64" lp64
 build_suite rv64uc "$ISA64C" lp64
+build_suite rv64si "$ISA64" lp64
+build_suite rv64mi "$ISA64" lp64
 
 echo "built $built test binaries into $OUT${failed:+, $failed failed}"
 [ "$failed" -eq 0 ]

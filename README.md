@@ -15,21 +15,24 @@ disagree.
 
 ## Status
 
-**RV32IMAC and RV64IMAC pass the official riscv-tests suite: 148/148.**
+**RV32IMAC and RV64IMAC, machine/supervisor/user modes, and virtual memory.
+192/192 on the official riscv-tests suite.**
 
 | Suite | Tests |
 | --- | --- |
-| `rv32ui` / `rv32um` / `rv32ua` / `rv32uc` | 42 + 8 + 10 + 1 |
-| `rv64ui` / `rv64um` / `rv64ua` / `rv64uc` | 54 + 13 + 19 + 1 |
-| hand-written (`rv32im.rs`, `rv64.rs`, `ac.rs`) | 21 + 13 + 18 |
+| `rv32` user: ui / um / ua / uc | 42 + 8 + 10 + 1 |
+| `rv64` user: ui / um / ua / uc | 54 + 13 + 19 + 1 |
+| `rv32si` / `rv32mi` privileged | 6 + 15 |
+| `rv64si` / `rv64mi` privileged | 7 + 16 |
+| hand-written | 81 |
 
-Five upstream tests are skipped by name in `tests/riscv_tests.rs`: the
-`amocas` ones are **Zacas**, a separate extension from A, which upstream
-happens to file in the `ua` directory.
+Seven upstream tests are skipped by name in `tests/riscv_tests.rs`, each for a
+feature that belongs to a *different* specification: the `amocas` tests need
+**Zacas** and the `breakpoint` tests need **Sdtrig**, the debug spec's trigger
+registers.
 
-Still missing before the emulator is "complete" in the RV64GC sense: F and D
-(floating point), supervisor mode with Sv39 paging, and the CLINT/PLIC/UART
-devices a Linux boot needs.
+Still missing before a Linux boot: F and D (floating point), a PLIC, and a
+UART. The CLINT is in, so timer and software interrupts work.
 
 ```
 make docs        # fetch specs, encodings and riscv-tests (once, after cloning)
@@ -58,14 +61,16 @@ work on one machine and not the next.
 emu/         the Rust simulator (crate: nanoemu)
   src/decode.rs   instruction field and immediate extraction
   src/cpu.rs      the hart: fetch, execute, trap, and the run loop
-  src/csr.rs      machine-mode control and status registers
-  src/memory.rs   flat little-endian DRAM at 0x8000_0000
+  src/csr.rs      control and status registers, with the supervisor aliases
+  src/mmu.rs      Sv32 and Sv39 address translation
+  src/memory.rs   flat little-endian DRAM at 0x8000_0000, plus the CLINT
   src/compress.rs the C extension, expanded to base instructions at fetch
   src/elf.rs      ELF32/ELF64 loader and symbol lookup
-  src/trap.rs     exception causes
+  src/trap.rs     privilege modes, exception and interrupt causes
   tests/rv32im.rs      hand-written RV32 tests, one per spec corner
   tests/rv64.rs        RV64 behaviour and the dual-width seams
   tests/ac.rs          the A and C extensions
+  tests/privileged.rs  privilege modes, delegation and virtual memory
   examples/diag.rs     prints the first unexpected trap in a test binary
   tests/riscv_tests.rs the official rv32/rv64 ui and um suites
 rtl/         the SystemVerilog core (not started — see rtl/README.md)
@@ -82,6 +87,29 @@ cached, because this model's only job is to be obviously right. When the RTL
 core arrives, `step()` is the unit the testbench compares against — after each
 one, the core's retire-stage state must match `pc`, `x1..x31` and the machine
 CSRs exactly.
+
+### Privilege is three rules, applied everywhere
+
+Delegation: a trap goes to supervisor mode when its cause is delegated *and*
+the hart is not already in machine mode. The second half matters — without it
+a kernel could capture the machine handler's own faults.
+
+The trap stack: entering a trap pushes the interrupt-enable and the previous
+privilege into the xPIE and xPP fields, and `xRET` pops them back out. That is
+the whole return mechanism. `xRET` then drops xPP to user, so a handler that
+returns twice cannot land back in machine mode the second time.
+
+Virtualisation traps: `TVM`, `TW` and `TSR` let machine mode intercept a
+supervisor's page tables, its idling, and its trap returns. They are what a
+hypervisor is built out of, which is why `TVM` covers reading `satp` and not
+just `SFENCE.VMA` — the page table root is as good as the walk.
+
+### The supervisor CSRs are windows, not registers
+
+`sstatus`, `sie` and `sip` are masked views of `mstatus`, `mie` and `mip`, so
+`src/csr.rs` aliases them onto the same storage. Modelling them as separate
+registers that are kept in sync is the standard way to get a bug that only
+shows up once a kernel writes one and reads the other.
 
 ### C is expanded, not executed
 
@@ -118,10 +146,13 @@ linker script use, so upstream test binaries will load without relinking.
 2. ~~**riscv-tests**~~ — the official `rv32ui` and `rv32um` suites, via an ELF32
    loader and the `tohost` handshake. **Done: 50/50.**
 3. **Complete the emulator** — in progress.
-   - ~~RV64IM: widen to 64-bit~~ **Done, `rv64ui`/`rv64um` pass.**
-   - A, C and F/D extensions, for a full RV64GC.
-   - Supervisor mode, Sv39 paging, CLINT, PLIC and a UART — enough to boot
-     Linux, with QEMU as a second reference when the two disagree.
+   - ~~RV64IM: widen to 64-bit~~ **Done.**
+   - ~~A and C extensions~~ **Done.**
+   - ~~Privilege modes, delegation, Sv32/Sv39 paging, CLINT~~ **Done,
+     `si` and `mi` suites pass.**
+   - F and D, for a full RV64GC.
+   - A PLIC and a UART — enough to boot Linux, with QEMU as a second
+     reference when the two disagree.
 4. **RTL core** — a 5-stage RV32I pipeline in SystemVerilog, verified by
    lockstep diff against milestone 1.
 5. **FPGA** — put it on the ZCU104 using the parent repo's board support.
@@ -162,6 +193,16 @@ These all have tests, because each one was worth a test:
   zeroed page traps instead of wandering.
 - An AMO returns the value that was in memory *beforehand*, and unlike
   ordinary loads and stores it must be naturally aligned.
+- Writing `minstret` suppresses that instruction's own increment, so the
+  value written is what the *next* instruction reads.
+- On RV32 an immediate shift by 32 or more is not a shift by 1 — bit 5 of the
+  shift amount belongs to funct7, so the encoding is illegal.
+- A CSR that is not implemented must raise an illegal instruction, not read as
+  zero. Zero tells software the feature is there and disabled.
+- `SUM` lets the supervisor read and write user pages but never execute them,
+  which would turn any user page into kernel code.
+- A superpage's low PPN bits must be zero, because those bits come from the
+  virtual address instead.
 - On RV64, `LUI` sign-extends. Every address at or above `0x8000_0000` has bit
   31 set, so `lui` cannot be used to build a DRAM address — it lands at the top
   of the address space instead.
