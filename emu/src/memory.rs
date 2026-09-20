@@ -29,6 +29,24 @@ impl Memory {
         self.dram[..image.len()].copy_from_slice(image);
     }
 
+    /// Places `data` at an arbitrary physical address, for an ELF segment.
+    pub fn load_at(&mut self, addr: u64, data: &[u8]) -> Result<(), Exception> {
+        let i = self
+            .index(addr, data.len() as u64)
+            .ok_or(Exception::StoreAccessFault(addr))?;
+        self.dram[i..i + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Clears `len` bytes, for the .bss tail of a segment.
+    pub fn zero(&mut self, addr: u64, len: u64) -> Result<(), Exception> {
+        let i = self
+            .index(addr, len)
+            .ok_or(Exception::StoreAccessFault(addr))?;
+        self.dram[i..i + len as usize].fill(0);
+        Ok(())
+    }
+
     fn index(&self, addr: u64, size: u64) -> Option<usize> {
         let off = addr.checked_sub(DRAM_BASE)?;
         if off.checked_add(size)? > self.dram.len() as u64 {

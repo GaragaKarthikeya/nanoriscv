@@ -35,5 +35,19 @@ the machine-readable source of truth for instruction bit patterns.
 - `causes.csv` — `mcause` values.
 - `encoding.h` — generated C header; handy for cross-checking a constant.
 
+## Conformance suite — `docs/riscv-tests/`
+
+A checkout of [riscv-software-src/riscv-tests](https://github.com/riscv-software-src/riscv-tests),
+cloned with submodules so that `env/p/` (the physical-memory environment's
+headers and linker script) comes along.
+
+- `isa/rv32ui/`, `isa/rv32um/` — the suites currently run. Each file includes
+  its `rv64ui` counterpart with `XLEN=32`.
+- `env/p/riscv_test.h` — the prologue every test expands: register init, PMP
+  setup, trap vector, and the `tohost` reporting macros.
+- `env/p/link.ld` — links the tests at `0x8000_0000`.
+
+`scripts/build-tests.sh` compiles these into `build/tests/`.
+
 Regenerate the tables with `make -C docs/opcodes` if a hand-written table ever
 disagrees with one of these files: the file wins.

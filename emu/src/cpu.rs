@@ -282,3 +282,70 @@ impl Cpu {
         }
     }
 }
+
+/// Why a program stopped. `Pass`/`Fail` come from the `tohost` protocol that
+/// riscv-tests uses; the rest are this simulator's own stopping conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    /// The payload wrote 1 to `tohost`.
+    Pass,
+    /// The payload wrote `(n << 1) | 1`; `n` is the number of the failing test.
+    Fail(u32),
+    /// An ECALL with no `tohost` symbol to interpret it.
+    Ecall,
+    /// A trap was raised with `mtvec` still zero, so there is no handler to
+    /// enter. Left as a distinct outcome because it is the usual symptom of a
+    /// test that never got as far as installing one.
+    UnhandledTrap(Exception),
+    /// Ran past the step budget -- almost always an infinite loop.
+    StepLimit,
+}
+
+impl Cpu {
+    /// Loads an ELF32 image: its PT_LOAD segments, entry point, and the
+    /// `tohost` symbol if the payload exports one.
+    pub fn load_elf(&mut self, elf: &crate::elf::Elf) -> Result<(), Exception> {
+        for seg in &elf.segments {
+            self.mem.load_at(seg.addr as u64, &seg.data)?;
+            if seg.zero_len > 0 {
+                self.mem
+                    .zero(seg.addr as u64 + seg.data.len() as u64, seg.zero_len as u64)?;
+            }
+        }
+        self.pc = elf.entry;
+        self.mem.tohost = elf.symbols.get("tohost").map(|&a| a as u64);
+        Ok(())
+    }
+
+    /// Steps until the program stops, for at most `max_steps` instructions.
+    ///
+    /// Traps are not stopping conditions on their own: a riscv-tests binary
+    /// installs a handler and deliberately traps as part of the test. The run
+    /// ends when the payload reports through `tohost`, or when a trap is taken
+    /// with no handler installed.
+    pub fn run(&mut self, max_steps: u64) -> Exit {
+        for _ in 0..max_steps {
+            let r = self.step();
+            if let Some(v) = self.mem.tohost_value {
+                // Bit 0 set means "terminate"; the rest is the payload's status,
+                // where 0 is success and n identifies the failing test case.
+                if v & 1 == 1 {
+                    return match (v >> 1) as u32 {
+                        0 => Exit::Pass,
+                        n => Exit::Fail(n),
+                    };
+                }
+                // An even value is a syscall request, which bare tests do not
+                // use; clear it and keep going.
+                self.mem.tohost_value = None;
+            }
+            match r {
+                Ok(()) => {}
+                Err(Exception::EnvironmentCall) if self.mem.tohost.is_none() => return Exit::Ecall,
+                Err(e) if self.csrs.read(csr::MTVEC) == 0 => return Exit::UnhandledTrap(e),
+                Err(_) => {}
+            }
+        }
+        Exit::StepLimit
+    }
+}

@@ -33,10 +33,23 @@ fetch "$LATEST" "$SPEC/riscv-spec-latest.pdf"
 
 # Machine-readable instruction encodings — the source of truth for the decoder
 # and for the RTL decode tables.
-if [ -d docs/opcodes ]; then
-  echo "have  docs/opcodes"
-else
-  echo "clone docs/opcodes"
-  git clone --depth 1 https://github.com/riscv/riscv-opcodes.git docs/opcodes
-  rm -rf docs/opcodes/.git
-fi
+clone() {
+  local url=$1 dir=$2 flags=${3:-}
+  if [ -d "$dir" ]; then
+    echo "have  $dir"
+    return
+  fi
+  echo "clone $dir"
+  # shellcheck disable=SC2086
+  git clone --depth 1 $flags "$url" "$dir"
+  rm -rf "$dir/.git"
+}
+
+clone https://github.com/riscv/riscv-opcodes.git docs/opcodes
+
+# The official conformance suite. --recursive picks up riscv-test-env, which
+# holds the p-environment headers and linker script the tests include.
+clone https://github.com/riscv-software-src/riscv-tests.git docs/riscv-tests --recursive
+
+echo
+echo "next: scripts/build-tests.sh"

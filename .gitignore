@@ -2,5 +2,7 @@
 docs/spec/*.pdf
 docs/spec/*.json
 docs/opcodes/
+docs/riscv-tests/
 
 emu/target/
+build/

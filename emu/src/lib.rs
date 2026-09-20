@@ -6,9 +6,11 @@
 pub mod cpu;
 pub mod csr;
 pub mod decode;
+pub mod elf;
 pub mod memory;
 pub mod trap;
 
-pub use cpu::Cpu;
+pub use cpu::{Cpu, Exit};
+pub use elf::Elf;
 pub use memory::DRAM_BASE;
 pub use trap::Exception;
