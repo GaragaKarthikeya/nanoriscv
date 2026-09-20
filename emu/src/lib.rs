@@ -10,7 +10,9 @@ pub mod decode;
 pub mod elf;
 pub mod memory;
 pub mod mmu;
+pub mod plic;
 pub mod trap;
+pub mod uart;
 
 pub use cpu::{Cpu, Exit, Xlen};
 pub use elf::Elf;

@@ -16,7 +16,9 @@ use crate::csr::{self, int, mstatus, CsrFile};
 use crate::decode::*;
 use crate::memory::{Memory, DRAM_BASE};
 use crate::mmu;
+use crate::plic;
 use crate::trap::{interrupt, Access, Exception, Priv};
+use crate::uart;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Xlen {
@@ -281,6 +283,22 @@ impl Cpu {
             self.csrs.set_bits(csr::MIP, int::MSIP);
         } else {
             self.csrs.clear_bits(csr::MIP, int::MSIP);
+        }
+
+        // Devices assert their lines into the PLIC, which decides whether a
+        // context has anything worth interrupting for. The external-interrupt
+        // bits are driven entirely from here, never written by software.
+        let uart_active = self.mem.uart.is_interrupting();
+        self.mem.plic.set_level(uart::UART_IRQ, uart_active);
+        for (context, bit) in [
+            (plic::CONTEXT_MACHINE, int::MEIP),
+            (plic::CONTEXT_SUPERVISOR, int::SEIP),
+        ] {
+            if self.mem.plic.is_pending(context) {
+                self.csrs.set_bits(csr::MIP, bit);
+            } else {
+                self.csrs.clear_bits(csr::MIP, bit);
+            }
         }
     }
 

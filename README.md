@@ -24,15 +24,22 @@ disagree.
 | `rv64` user: ui / um / ua / uc | 54 + 13 + 19 + 1 |
 | `rv32si` / `rv32mi` privileged | 6 + 15 |
 | `rv64si` / `rv64mi` privileged | 7 + 16 |
-| hand-written | 81 |
+| hand-written | 97 |
 
 Seven upstream tests are skipped by name in `tests/riscv_tests.rs`, each for a
 feature that belongs to a *different* specification: the `amocas` tests need
 **Zacas** and the `breakpoint` tests need **Sdtrig**, the debug spec's trigger
 registers.
 
-Still missing before a Linux boot: F and D (floating point), a PLIC, and a
-UART. The CLINT is in, so timer and software interrupts work.
+The devices are in too — CLINT, PLIC and a 16550 UART, at the addresses
+QEMU's `virt` machine uses, so a stock device tree describes them correctly.
+
+```
+make demo    # a bare-metal program printing through the UART
+```
+
+Still missing before a Linux boot: F and D (floating point), and a device
+tree to hand the kernel.
 
 ```
 make docs        # fetch specs, encodings and riscv-tests (once, after cloning)
@@ -63,7 +70,9 @@ emu/         the Rust simulator (crate: nanoemu)
   src/cpu.rs      the hart: fetch, execute, trap, and the run loop
   src/csr.rs      control and status registers, with the supervisor aliases
   src/mmu.rs      Sv32 and Sv39 address translation
-  src/memory.rs   flat little-endian DRAM at 0x8000_0000, plus the CLINT
+  src/memory.rs   the memory map: DRAM at 0x8000_0000, and the devices
+  src/plic.rs     platform-level interrupt controller
+  src/uart.rs     NS16550a console
   src/compress.rs the C extension, expanded to base instructions at fetch
   src/elf.rs      ELF32/ELF64 loader and symbol lookup
   src/trap.rs     privilege modes, exception and interrupt causes
@@ -71,6 +80,8 @@ emu/         the Rust simulator (crate: nanoemu)
   tests/rv64.rs        RV64 behaviour and the dual-width seams
   tests/ac.rs          the A and C extensions
   tests/privileged.rs  privilege modes, delegation and virtual memory
+  tests/devices.rs     the PLIC and UART, including a full interrupt path
+examples/    hello.S and a linker script, for `make demo`
   examples/diag.rs     prints the first unexpected trap in a test binary
   tests/riscv_tests.rs the official rv32/rv64 ui and um suites
 rtl/         the SystemVerilog core (not started — see rtl/README.md)
@@ -87,6 +98,24 @@ cached, because this model's only job is to be obviously right. When the RTL
 core arrives, `step()` is the unit the testbench compares against — after each
 one, the core's retire-stage state must match `pc`, `x1..x31` and the machine
 CSRs exactly.
+
+### An interrupt has to travel the whole way
+
+The PLIC's claim/complete handshake is the part worth understanding. A
+handler *claims* an interrupt, which in one step tells it which device fired
+and stops that source interrupting again; it *completes* the interrupt once
+the device is quiet. Without the second half, a level-triggered device
+re-raises the instant the handler returns and the machine livelocks.
+
+Sources here are level-triggered, so the PLIC tracks what each device is
+asserting *now* rather than latching events. Completing a source whose line
+is still high makes it pending again immediately — which is correct, and is
+what `tests/devices.rs` pins down.
+
+The UART is a 1987 design and it shows: eight byte-wide registers, two of
+which change meaning depending on the DLAB bit in a third. Nothing here cares
+about baud rate, but the divisor has to be writable and readable or driver
+probing fails.
 
 ### Privilege is three rules, applied everywhere
 
@@ -150,9 +179,10 @@ linker script use, so upstream test binaries will load without relinking.
    - ~~A and C extensions~~ **Done.**
    - ~~Privilege modes, delegation, Sv32/Sv39 paging, CLINT~~ **Done,
      `si` and `mi` suites pass.**
+   - ~~CLINT, PLIC and a 16550 UART~~ **Done.**
    - F and D, for a full RV64GC.
-   - A PLIC and a UART — enough to boot Linux, with QEMU as a second
-     reference when the two disagree.
+   - A device tree, then a Linux boot, with QEMU as a second reference when
+     the two disagree.
 4. **RTL core** — a 5-stage RV32I pipeline in SystemVerilog, verified by
    lockstep diff against milestone 1.
 5. **FPGA** — put it on the ZCU104 using the parent repo's board support.
@@ -203,6 +233,11 @@ These all have tests, because each one was worth a test:
   which would turn any user page into kernel code.
 - A superpage's low PPN bits must be zero, because those bits come from the
   virtual address instead.
+- A 16550 with the transmit interrupt enabled asserts *continuously*, because
+  the holding register is always empty. That is not a bug to work around;
+  drivers enable that bit only while they have something to send.
+- The PLIC's priority comparison against the threshold is strict, so a
+  priority equal to the threshold is masked, and priority 0 never interrupts.
 - On RV64, `LUI` sign-extends. Every address at or above `0x8000_0000` has bit
   31 set, so `lui` cannot be used to build a DRAM address — it lands at the top
   of the address space instead.

@@ -1,6 +1,6 @@
 EMU := emu
 
-.PHONY: test test-isa isa build run fmt lint docs clean
+.PHONY: test test-isa isa build run demo fmt lint docs clean
 
 # Runs the hand-written tests and, if they have been built, the official suite.
 test:
@@ -20,6 +20,14 @@ build:
 # make run IMG=path/to/image.bin
 run: build
 	$(EMU)/target/release/nanoemu $(IMG)
+
+# Builds and runs the bare-metal console demo, which prints through the UART.
+demo: build
+	mkdir -p build
+	riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	  -nostdlib -nostartfiles -T examples/bare.ld \
+	  examples/hello.S -o build/hello.elf
+	$(EMU)/target/release/nanoemu build/hello.elf --quiet
 
 fmt:
 	cd $(EMU) && cargo fmt

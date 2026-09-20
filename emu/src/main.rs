@@ -6,6 +6,8 @@
 //! An ELF selects its own width from its class; --rv32/--rv64 only apply to a
 //! flat image, and default to RV64.
 //!
+//! Output written to the UART at 0x1000_0000 is echoed to stdout.
+//!
 //! The exit code is 0 on success, 1 on a test failure or unhandled trap, and
 //! 3 if the step budget ran out.
 
@@ -61,6 +63,9 @@ fn main() -> ExitCode {
     // A flat image has no class to read, so it needs the width stated; an ELF
     // overrides this from its own header.
     let mut cpu = Cpu::new(MEM_SIZE, xlen);
+    // Anything the guest writes to the UART goes to our stdout, so a program
+    // with a console driver prints where you would expect.
+    cpu.mem.uart.echo = true;
     // Anything without the ELF magic is treated as a flat image at DRAM_BASE.
     if image.starts_with(b"\x7fELF") {
         match Elf::parse(&image) {

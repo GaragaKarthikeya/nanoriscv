@@ -1,5 +1,9 @@
-//! Physical memory: flat little-endian DRAM, the CLINT, and the `tohost`
-//! handshake the riscv-tests suite uses to report pass/fail.
+//! Physical memory and the memory map: flat little-endian DRAM, the CLINT,
+//! the PLIC, a UART, and the `tohost` handshake the riscv-tests suite uses to
+//! report pass/fail.
+//!
+//! The device addresses follow QEMU's `virt` machine, because that is what
+//! stock Linux device trees and bootloaders already describe.
 //!
 //! A failed access here is `Unmapped`. Whether that becomes a load fault, a store
 //! fault or an instruction fault depends on what the access was for, and only
@@ -20,6 +24,9 @@ impl std::fmt::Display for Unmapped {
 }
 
 impl std::error::Error for Unmapped {}
+
+use crate::plic::{Plic, PLIC_BASE, PLIC_SIZE};
+use crate::uart::{Uart, UART_BASE, UART_SIZE};
 
 /// Where DRAM appears in the physical address space. Matches the convention
 /// used by SiFive boards and the riscv-tests default linker script.
@@ -46,6 +53,8 @@ pub struct Clint {
 pub struct Memory {
     dram: Vec<u8>,
     pub clint: Clint,
+    pub plic: Plic,
+    pub uart: Uart,
     /// Address the payload writes to signal termination, if it declares one.
     pub tohost: Option<u64>,
     /// Last value written to `tohost`; `Some(0)` never occurs (0 means "running").
@@ -57,6 +66,8 @@ impl Memory {
         Memory {
             dram: vec![0; size],
             clint: Clint::default(),
+            plic: Plic::default(),
+            uart: Uart::default(),
             tohost: None,
             tohost_value: None,
         }
@@ -90,9 +101,20 @@ impl Memory {
     }
 
     /// `size` is in bytes and must be 1, 2, 4 or 8.
-    pub fn read(&self, addr: u64, size: u64) -> Result<u64, Unmapped> {
+    /// Reads physical memory or a device.
+    ///
+    /// Takes `&mut self` because a device read can have side effects -- the
+    /// PLIC's claim register hands back an interrupt *and* claims it, and
+    /// reading the UART consumes a byte.
+    pub fn read(&mut self, addr: u64, size: u64) -> Result<u64, Unmapped> {
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             return Ok(self.clint_read(addr, size));
+        }
+        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
+            return Ok(self.plic.read(addr - PLIC_BASE));
+        }
+        if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
+            return Ok(self.uart.read(addr - UART_BASE));
         }
         let i = self.index(addr, size).ok_or(Unmapped)?;
         let mut v = 0u64;
@@ -105,6 +127,14 @@ impl Memory {
     pub fn write(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Unmapped> {
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             self.clint_write(addr, size, value);
+            return Ok(());
+        }
+        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
+            self.plic.write(addr - PLIC_BASE, value);
+            return Ok(());
+        }
+        if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
+            self.uart.write(addr - UART_BASE, value);
             return Ok(());
         }
         let i = self.index(addr, size).ok_or(Unmapped)?;
