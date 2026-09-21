@@ -41,8 +41,16 @@ A checkout of [riscv-software-src/riscv-tests](https://github.com/riscv-software
 cloned with submodules so that `env/p/` (the physical-memory environment's
 headers and linker script) comes along.
 
-- `isa/rv32ui/`, `isa/rv32um/` — the suites currently run. Each file includes
-  its `rv64ui` counterpart with `XLEN=32`.
+- `isa/rv32u*/`, `isa/rv64u*/` — the user-mode suites: `ui`, `um`, `ua`, `uc`,
+  `uf` and `ud` at both widths. Each `rv32` file includes its `rv64`
+  counterpart with `XLEN=32`, which is why one source tree covers both.
+- `isa/rv32si/`, `isa/rv32mi/`, `isa/rv64si/`, `isa/rv64mi/` — the privileged
+  suites: traps, delegation and paging.
+
+All sixteen run, and all sixteen pass — 236/236, less the seven skipped by
+name in `emu/tests/riscv_tests.rs` for features in other specifications
+(Zacas, Sdtrig) and one RV32 file excluded upstream. See the table in the
+top-level README.
 - `env/p/riscv_test.h` — the prologue every test expands: register init, PMP
   setup, trap vector, and the `tohost` reporting macros.
 - `env/p/link.ld` — links the tests at `0x8000_0000`.
