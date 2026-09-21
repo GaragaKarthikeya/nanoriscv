@@ -203,7 +203,9 @@ linker script use, so upstream test binaries will load without relinking.
      userspace and powers off through SBI.**
 4. **RTL core** — a 5-stage RV32I pipeline in SystemVerilog, verified by
    lockstep diff against milestone 1.
-5. **FPGA** — put it on the ZCU104 using the parent repo's board support.
+5. **FPGA** — put it on the ZCU104 using the board support in
+   [nanocodex](https://github.com/GaragaKarthikeya/nanocodex), the separate
+   project that tracks this repository as a submodule.
 
 Milestones 2 and 4 are independent; 4 only needs 1.
 
