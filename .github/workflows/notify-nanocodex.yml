@@ -1,0 +1,35 @@
+name: Notify nanocodex
+
+# nanocodex tracks this repository as a submodule, and a submodule pointer is
+# a recorded SHA rather than a floating reference. So every push to main here
+# has to tell nanocodex to move its pointer, or it silently goes stale.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  notify:
+    name: ping nanocodex to bump its submodule
+    runs-on: ubuntu-latest
+    steps:
+      # NANOCODEX_DISPATCH_TOKEN is a fine-grained PAT with Contents: read and
+      # write on GaragaKarthikeya/nanocodex. The built-in GITHUB_TOKEN cannot
+      # be used here: its scope stops at this repository.
+      - name: Send repository_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.NANOCODEX_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "NANOCODEX_DISPATCH_TOKEN is not set -- skipping." >&2
+            echo "nanocodex will still catch up via its daily schedule." >&2
+            exit 0
+          fi
+
+          gh api repos/GaragaKarthikeya/nanocodex/dispatches \
+            --method POST \
+            --field event_type=nanoriscv-updated \
+            --raw-field "client_payload[sha]=$GITHUB_SHA" \
+            --raw-field "client_payload[ref]=$GITHUB_REF"
+
+          echo "Asked nanocodex to bump to ${GITHUB_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"

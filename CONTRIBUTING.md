@@ -67,3 +67,16 @@ because this model's only job is to be obviously right. Optimisations that
 cost clarity are the wrong trade here — the RTL core is where speed lives.
 
 Keep the dependency count at zero unless there is a strong reason not to.
+
+## A note on nanocodex
+
+[nanocodex](https://github.com/GaragaKarthikeya/nanocodex), the FPGA
+workstation this core is destined for, tracks this repository as a submodule.
+Every push to `main` here fires `.github/workflows/notify-nanocodex.yml`,
+which asks nanocodex to bump its pointer.
+
+Two consequences worth knowing. **Force-pushing `main` here will make that bump
+refuse**, by design — nanocodex only moves its pointer forward, so a rewritten
+history has to be sorted out by hand. And the ping needs the
+`NANOCODEX_DISPATCH_TOKEN` secret; without it the workflow skips quietly and
+nanocodex falls back to its daily schedule.
