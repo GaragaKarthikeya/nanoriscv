@@ -12,6 +12,7 @@ Intended shape, for when work starts:
   architectural state is compared against a `nanoemu` step; the first mismatch
   fails the test and prints both states.
 - `soc/` — the wrapper that puts the core on the ZCU104, reusing `boards/zcu104`
-  from the parent repo.
+  from [nanocodex](https://github.com/GaragaKarthikeya/nanocodex), which tracks
+  this repository as a submodule.
 
 Verilator is already on this machine (`/usr/local/bin/verilator`).

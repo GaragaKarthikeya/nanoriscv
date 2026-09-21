@@ -105,8 +105,24 @@ examples/    hello.S and a linker script, for `make demo`
 rtl/         the SystemVerilog core (not started — see rtl/README.md)
 docs/        specs, encodings, riscv-tests (gitignored; see docs/README.md)
 build/       compiled test binaries (gitignored)
+  build/Image       the Linux kernel — NOT reproducible, see below
 scripts/     fetch-docs.sh, build-tests.sh
 ```
+
+### `build/Image` is an input, not an output
+
+Everything else under `build/` and `docs/` is gitignored *because* it is
+reproducible: `make docs` refetches the specs and the riscv-tests checkout,
+`make isa` recompiles the 243 test binaries. `build/Image` is the exception.
+It is the ~20 MB Linux kernel the emulator boots, and **nothing in this
+repository or in nanocodex builds it** — there is no kernel config and no
+fetch script. It was built out of tree, once.
+
+So it is gitignored for its size, not its reproducibility, and a clean clone
+will not have it. Treat it as source: keep a copy somewhere off this machine,
+and check it is backed up before any operation that removes or recreates
+`build/`. Committing a kernel image is the wrong fix; a `make kernel` target
+that builds it from a pinned config is the right one, and does not exist yet.
 
 ## How the emulator is organised
 
