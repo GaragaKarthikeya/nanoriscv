@@ -11,7 +11,12 @@ None of this is committed — run `scripts/fetch-docs.sh` to pull it.
 | `riscv-spec-latest.pdf` | Both volumes, nightly build off `main` | Extensions ratified after the frozen release. Draft — do not cite its section numbers. |
 | `norm-rules.json` | Normative rules extracted from the nightly | Machine-readable checklist of "the hart MUST ..." statements. |
 
-The sections that matter for the current milestone:
+The sections that matter, now that the emulator is RV64GC with privilege and
+paging. Section numbers are given where they have been checked against the
+ratified PDFs; the rest are named by chapter, because a number copied from the
+nightly is exactly the mistake this file exists to prevent.
+
+Base and integer arithmetic:
 
 - **Vol I §2.1–2.6** — RV32I base: the 47 instructions, the six formats, and the
   immediate-encoding rationale that explains why the bit scrambling in
@@ -20,8 +25,36 @@ The sections that matter for the current milestone:
   a set/clear with `rs1 == x0` must not write the CSR.
 - **Vol I §4.5** — M extension. Division by zero and signed overflow have
   *defined* results; they do not trap.
+- **Vol I, "RV64I Base Integer Instruction Set"** — the `*W` instructions and
+  the shift-amount widening. The whole of `emu/src/cpu.rs`'s dual-width ALU is
+  this chapter.
+
+Extensions:
+
+- **Vol I, "A" Standard Extension** — the AMOs return the *prior* memory value
+  and must be naturally aligned, unlike ordinary loads and stores. LR/SC
+  reservation rules.
+- **Vol I, "C" Standard Extension** — each RVC instruction is defined as an
+  alias for exactly one base instruction, which is what licenses the
+  expand-at-fetch approach in `emu/src/compress.rs`. The immediate-field tables
+  are the part to read closely; they are scrambled on purpose.
+- **Vol I, "F" and "D" Standard Extensions** — NaN-boxing of single-precision
+  values in `f` registers, the canonical NaN, the five rounding modes, and the
+  `fcsr` accumulated flags. Tininess is judged *after* rounding.
+
+Privilege, traps and memory:
+
 - **Vol II §3.1** — `mstatus`, `mtvec`, `mepc`, `mcause`, `mtval`.
 - **Vol II §3.3.1** — trap entry and `mret`.
+- **Vol II, machine-mode delegation** — `medeleg`/`mideleg`, and the rule that
+  a trap only drops to supervisor mode when the hart is not already in machine
+  mode.
+- **Vol II, "Supervisor-Level ISA"** — `sstatus`, `sie` and `sip` as masked
+  *views* of their machine counterparts, which is why `emu/src/csr.rs` aliases
+  them onto one storage rather than keeping two in sync. Also `TVM`, `TW` and
+  `TSR`.
+- **Vol II, Sv32 and Sv39 page-based virtual memory** — the walk, superpage
+  alignment (a superpage's low PPN bits must be zero), and `SUM`/`MXR`.
 
 ## Encodings — `docs/opcodes/`
 
