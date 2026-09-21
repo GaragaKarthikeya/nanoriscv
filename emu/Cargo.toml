@@ -3,6 +3,11 @@ name = "nanoemu"
 version = "0.1.0"
 edition = "2021"
 description = "Reference RISC-V instruction set simulator, golden model for the nanoriscv RTL core"
+license = "Apache-2.0"
+repository = "https://github.com/GaragaKarthikeya/nanoriscv"
+readme = "../README.md"
+keywords = ["riscv", "emulator", "simulator", "rv64gc", "cpu"]
+categories = ["emulators", "simulation", "hardware-support"]
 
 [dependencies]
 

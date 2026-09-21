@@ -73,7 +73,8 @@ build_suite() { # <suite dir name> <march> <mabi>
   local suite=$1 march=$2 mabi=$3
   [ -d "$TESTS/isa/$suite" ] || return 0
   for src in "$TESTS/isa/$suite"/*.S; do
-    local name="$suite-p-$(basename "$src" .S)"
+    local name
+    name="$suite-p-$(basename "$src" .S)"
     case "$NOT_BUILDABLE" in *" $name "*) continue ;; esac
     if compile "$march" "$mabi" "$src" "$OUT/$name.elf" "$OUT/$name.log"; then
       rm -f "$OUT/$name.log"

@@ -1,5 +1,10 @@
 # nanoriscv
 
+[![CI](https://github.com/GaragaKarthikeya/nanoriscv/actions/workflows/ci.yml/badge.svg)](https://github.com/GaragaKarthikeya/nanoriscv/actions/workflows/ci.yml)
+[![riscv-tests](https://img.shields.io/badge/riscv--tests-236%2F236-brightgreen)](https://github.com/riscv-software-src/riscv-tests)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![dependencies](https://img.shields.io/badge/dependencies-none-blue)](emu/Cargo.toml)
+
 A RISC-V processor built from scratch, twice: once as a Rust instruction-set
 simulator, then as a SystemVerilog core verified against it.
 
@@ -323,3 +328,13 @@ A test suite that passes on the first run has not yet been shown to be capable
 of failing. After this suite first went green, `SRA` was changed to a logical
 shift and the suite re-run: `rv32ui-p-sra` failed and nothing else did. Worth
 repeating after any change to how results are collected.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE). The patent grant is deliberate: this is a
+hardware project, and the RTL core in `rtl/` is meant to be usable without a
+patent question hanging over it.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).

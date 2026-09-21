@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The emulator has no dependencies, so this needs nothing but a Rust
+  # toolchain and finishes in under a minute.
+  test:
+    name: hand-written tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Format
+        working-directory: emu
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: emu
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: emu
+        run: cargo test --release
+
+  # The official conformance suite. Kept separate because it needs a RISC-V
+  # cross-compiler, which is most of this job's runtime.
+  riscv-tests:
+    name: riscv-tests (236 binaries)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      # build-tests.sh prefers riscv64-unknown-elf-gcc and falls back to clang
+      # plus an LLD. The GNU toolchain is not packaged for Ubuntu, so CI takes
+      # the documented fallback path.
+      - name: Install clang and LLD
+        run: sudo apt-get update && sudo apt-get install -y clang-18 lld-18
+
+      # fetch-docs.sh also pulls two spec PDFs and riscv-opcodes, which the
+      # test build does not need -- only the suite itself is cloned here.
+      - name: Fetch riscv-tests
+        run: |
+          git clone --depth 1 --recursive \
+            https://github.com/riscv-software-src/riscv-tests.git \
+            docs/riscv-tests
+
+      - name: Build the suite
+        run: scripts/build-tests.sh
+
+      - name: Run the suite
+        working-directory: emu
+        run: cargo test --release --test riscv_tests -- --nocapture 2>&1 | tee ../suite.log
+
+      # riscv_tests.rs passes vacuously when no binaries are present, so a
+      # green run is not on its own evidence the suite ran. Count what it
+      # reported and fail if the total moved.
+      - name: Check the whole suite actually ran
+        run: |
+          total=$(grep -oE '^rv[0-9a-z]+-p-: [0-9]+ tests passed' suite.log \
+                  | grep -oE '[0-9]+ tests' | grep -oE '[0-9]+' \
+                  | paste -sd+ | bc)
+          echo "suite total: ${total:-0}"
+          if [ "${total:-0}" -ne 236 ]; then
+            echo "expected 236 passing tests, got ${total:-0}" >&2
+            exit 1
+          fi
+
+  scripts:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck scripts/*.sh
